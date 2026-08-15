@@ -1,0 +1,41 @@
+# Local-only planning and working documentation.
+/docs/design/
+/docs/_local/
+
+# Local Go build outputs. The Makefile writes command binaries to /bin.
+/bin/
+/dist/
+
+# Legacy root-level build outputs remain ignored.
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go test, coverage, profiling, and debugger outputs.
+*.test
+*.coverprofile
+/coverage/
+/coverage.out
+/coverage.html
+/profiles/
+__debug_bin*
+
+# Local Go workspace files for this single-module project.
+/go.work
+/go.work.sum
+
+
+/tmp/
+
+# Operating-system metadata.
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+

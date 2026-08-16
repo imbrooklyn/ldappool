@@ -6,7 +6,7 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-08-16
+## [0.1.0-alpha] - 2026-08-16
 
 ### Added
 
@@ -35,5 +35,5 @@ All notable changes to this project are documented here. The format follows
 - The release scan has no reachable or imported-package vulnerabilities;
   module-only GO-2026-5932 is documented as an unreachable residual risk.
 
-[Unreleased]: https://github.com/imbrooklyn/ldappool/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/imbrooklyn/ldappool/releases/tag/v0.1.0
+[Unreleased]: https://github.com/imbrooklyn/ldappool/compare/v0.1.0-alpha...HEAD
+[0.1.0-alpha]: https://github.com/imbrooklyn/ldappool/releases/tag/v0.1.0-alpha

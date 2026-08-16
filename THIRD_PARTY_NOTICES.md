@@ -1,10 +1,11 @@
 # Third-Party Notices
 
 `ldappool` is licensed under the MIT License. Its compiled production-package
-dependency graph at v0.1.0 includes the following third-party modules. Upstream
-modules may declare additional dependencies for optional subpackages and their
-own tests; those are not linked into this package. Each dependency's own license
-file is authoritative and must be preserved when source is redistributed.
+dependency graph at v0.1.0-alpha includes the following third-party modules.
+Upstream modules may declare additional dependencies for optional subpackages
+and their own tests; those are not linked into this package. Each dependency's
+own license file is authoritative and must be preserved when source is
+redistributed.
 
 | Module | Version | License | Use |
 |---|---:|---|---|

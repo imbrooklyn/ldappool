@@ -2,7 +2,7 @@
 /docs/design/
 /docs/_local/
 
-# Local Go build outputs. The Makefile writes command binaries to /bin.
+# Local Go build outputs.
 /bin/
 /dist/
 
@@ -38,4 +38,3 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
-

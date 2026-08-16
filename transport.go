@@ -19,6 +19,8 @@ type operationTrace struct {
 	writeErr      error
 	readErr       error
 	stopWrites    bool
+	requests      ldapMessageStream
+	responses     ldapMessageStream
 }
 
 var errTraceCanceled = errors.New("ldappool: operation canceled before transport write")
@@ -62,6 +64,18 @@ func (t *operationTrace) recordRead(err error) {
 	}
 }
 
+func (t *operationTrace) recordProtocolWrite(buffer []byte) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.requests.feed(buffer)
+}
+
+func (t *operationTrace) recordProtocolRead(buffer []byte) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.responses.feed(buffer)
+}
+
 func (t *operationTrace) snapshot() traceSnapshot {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -72,6 +86,8 @@ func (t *operationTrace) snapshot() traceSnapshot {
 		reads:         t.reads,
 		writeErr:      t.writeErr,
 		readErr:       t.readErr,
+		requests:      t.requests.snapshot(),
+		responses:     t.responses.snapshot(),
 	}
 }
 
@@ -81,9 +97,17 @@ func (t *operationTrace) cancel() traceSnapshot {
 	snapshot := traceSnapshot{
 		writes: t.writes, writtenBytes: t.writtenBytes, writeInFlight: t.writeInFlight,
 		reads: t.reads, writeErr: t.writeErr, readErr: t.readErr,
+		requests: t.requests.snapshot(), responses: t.responses.snapshot(),
 	}
 	t.mu.Unlock()
 	return snapshot
+}
+
+func (t *operationTrace) destroy() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.requests.destroy()
+	t.responses.destroy()
 }
 
 type traceSnapshot struct {
@@ -93,6 +117,8 @@ type traceSnapshot struct {
 	reads         uint64
 	writeErr      error
 	readErr       error
+	requests      ldapStreamSnapshot
+	responses     ldapStreamSnapshot
 }
 
 type trackedConn struct {
@@ -105,6 +131,35 @@ type trackedConn struct {
 }
 
 func newTrackedConn(conn net.Conn) *trackedConn { return &trackedConn{Conn: conn} }
+
+type protocolConn struct {
+	net.Conn
+	active *atomic.Pointer[operationTrace]
+}
+
+func newProtocolConn(conn net.Conn, active *atomic.Pointer[operationTrace]) net.Conn {
+	return &protocolConn{Conn: conn, active: active}
+}
+
+func (c *protocolConn) Read(buffer []byte) (int, error) {
+	n, err := c.Conn.Read(buffer)
+	if n > 0 {
+		if trace := c.active.Load(); trace != nil {
+			trace.recordProtocolRead(buffer[:n])
+		}
+	}
+	return n, err
+}
+
+func (c *protocolConn) Write(buffer []byte) (int, error) {
+	n, err := c.Conn.Write(buffer)
+	if n > 0 {
+		if trace := c.active.Load(); trace != nil {
+			trace.recordProtocolWrite(buffer[:n])
+		}
+	}
+	return n, err
+}
 
 func (c *trackedConn) begin() *operationTrace {
 	trace := &operationTrace{}

@@ -11,7 +11,7 @@ redistributed.
 |---|---:|---|---|
 | `github.com/go-ldap/ldap/v3` | v3.4.14 | MIT | Direct LDAP protocol dependency |
 | `github.com/Azure/go-ntlmssp` | v0.1.1 | MIT | Transitive go-ldap dependency |
-| `github.com/go-asn1-ber/asn1-ber` | v1.5.8 | MIT | Transitive BER encoding dependency |
+| `github.com/go-asn1-ber/asn1-ber` | v1.5.8 | MIT | Direct BER encoding and strict response validation dependency |
 | `github.com/google/uuid` | v1.6.0 | BSD-3-Clause | Transitive go-ldap dependency |
 | `golang.org/x/crypto` | v0.54.0 | BSD-3-Clause | Transitive cryptography dependency |
 

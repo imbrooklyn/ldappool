@@ -224,20 +224,109 @@ func TestBindNetworkFailureRetainsRawTransportCause(t *testing.T) {
 	}
 }
 
-func TestBindSuccessRequiresCleanTransportBeforeGuardConfirmation(t *testing.T) {
-	if failure := validateBindSuccess(traceSnapshot{writtenBytes: 1}); failure != nil {
-		t.Fatalf("clean Bind trace was rejected: %+v", failure)
+func TestBindSuccessRequiresStrictBindResponse(t *testing.T) {
+	callbackCalled := false
+	dialer := &testDialer{factory: pipeFactory(func(conn net.Conn, _ int) {
+		defer conn.Close()
+		request, err := readLDAPRequest(bufio.NewReader(conn))
+		if err == nil {
+			_ = writeLDAPResult(conn, request.messageID, ldap.ApplicationAddResponse, ldap.LDAPResultSuccess, "")
+		}
+	}, nil)}
+	pool, err := New(simpleTestConfig(dialer))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if failure := validateBindSuccess(traceSnapshot{}); failure == nil || failure.reason != ReasonProtocol {
-		t.Fatalf("undispatched Bind trace failure = %+v", failure)
+	err = pool.WithConnection(contextWithTimeout(t), func(*Connection) error {
+		callbackCalled = true
+		return nil
+	})
+	if !errors.Is(err, ErrProtocol) || callbackCalled {
+		t.Fatalf("wrong-tag Bind success = %v, protocol=%v, callback=%v, snapshot=%+v", err, errors.Is(err, ErrProtocol), callbackCalled, pool.Snapshot())
+	}
+	if snapshot := pool.Snapshot(); snapshot.CredentialState != CredentialClear {
+		t.Fatalf("wrong-tag Bind changed Guard state: %+v", snapshot)
+	}
+	if err := pool.Close(contextWithTimeout(t)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBindSuccessRequiresHealthyTransport(t *testing.T) {
+	if failure := validateBindTransport(traceSnapshot{}); failure != nil {
+		t.Fatalf("clean Bind transport was rejected: %+v", failure)
 	}
 	root := io.EOF
-	failure := validateBindSuccess(traceSnapshot{writtenBytes: 1, readErr: root})
+	failure := validateBindTransport(traceSnapshot{readErr: root})
 	if failure == nil || failure.reason != ReasonTransport || !errors.Is(failure.cause, root) {
-		t.Fatalf("transport-damaged Bind trace failure = %+v", failure)
+		t.Fatalf("closed Bind transport failure = %+v", failure)
 	}
-	if failure := validateBindSuccess(traceSnapshot{writtenBytes: 1, writeInFlight: 1}); failure == nil || failure.reason != ReasonTransport {
-		t.Fatalf("in-flight Bind trace failure = %+v", failure)
+	if failure := validateBindTransport(traceSnapshot{writeInFlight: 1}); failure == nil || failure.reason != ReasonTransport {
+		t.Fatalf("in-flight Bind transport failure = %+v", failure)
+	}
+}
+
+func TestBindRejectsTruncatedNonzeroResultCode(t *testing.T) {
+	callbackCalled := false
+	dialer := &testDialer{factory: pipeFactory(func(conn net.Conn, _ int) {
+		defer conn.Close()
+		request, err := readLDAPRequest(bufio.NewReader(conn))
+		if err == nil {
+			_ = writeLDAPResultCode(conn, request.messageID, ldap.ApplicationBindResponse, 65536, "")
+		}
+	}, nil)}
+	pool, err := New(simpleTestConfig(dialer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = pool.WithConnection(contextWithTimeout(t), func(*Connection) error {
+		callbackCalled = true
+		return nil
+	})
+	if !errors.Is(err, ErrCredentialBlocked) || callbackCalled {
+		t.Fatalf("truncated Bind result code = %v, callback=%v", err, callbackCalled)
+	}
+	if snapshot := pool.Snapshot(); snapshot.CredentialState != CredentialBlocked || snapshot.CredentialReason != CredentialReasonUnknown {
+		t.Fatalf("credential snapshot = %+v", snapshot)
+	}
+	if err := pool.Close(contextWithTimeout(t)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMalformedBindControlStillBlocksInvalidCredentials(t *testing.T) {
+	dialer := &testDialer{factory: pipeFactory(func(conn net.Conn, _ int) {
+		defer conn.Close()
+		request, err := readLDAPRequest(bufio.NewReader(conn))
+		if err != nil {
+			return
+		}
+		result := append(berInteger(0x0a, ldap.LDAPResultInvalidCredentials), berOctet(nil)...)
+		result = append(result, berOctet([]byte("sensitive diagnostic"))...)
+		response := berTLV(0x60|ldap.ApplicationBindResponse, result)
+		malformedControls := berTLV(0xa0, berTLV(0x30, nil))
+		message := append(berInteger(0x02, request.messageID), response...)
+		message = append(message, malformedControls...)
+		_, _ = conn.Write(berTLV(0x30, message))
+	}, nil)}
+	pool, err := New(simpleTestConfig(dialer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		err = pool.WithConnection(contextWithTimeout(t), func(*Connection) error { return nil })
+		if !errors.Is(err, ErrCredentialBlocked) || !ldap.IsErrorWithCode(err, ldap.LDAPResultInvalidCredentials) || strings.Contains(err.Error(), "sensitive diagnostic") {
+			t.Fatalf("malformed-control Bind attempt %d = %v", attempt+1, err)
+		}
+	}
+	if dialer.count() != 1 {
+		t.Fatalf("credential guard allowed %d malformed-control Bind attempts", dialer.count())
+	}
+	if snapshot := pool.Snapshot(); snapshot.CredentialState != CredentialBlocked || snapshot.CredentialReason != CredentialReasonInvalid {
+		t.Fatalf("credential snapshot = %+v", snapshot)
+	}
+	if err := pool.Close(contextWithTimeout(t)); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -823,6 +912,66 @@ func TestTransportWriteFailureEmitsUnknownOutcome(t *testing.T) {
 	event := waitForEvent(t, observer, EventWriteOutcomeUnknown)
 	if event.Operation != OperationModify || event.Reason != ReasonTransport {
 		t.Fatalf("unknown-outcome event = %+v", event)
+	}
+	if err := pool.Close(contextWithTimeout(t)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIdlePeerCloseEvictsConnectionAfterNotSentFailure(t *testing.T) {
+	closeFirstPeer := make(chan struct{})
+	dialer := &testDialer{factory: func(_ context.Context, call int) (net.Conn, error) {
+		client, server := net.Pipe()
+		if call == 1 {
+			go func() {
+				<-closeFirstPeer
+				_ = server.Close()
+			}()
+		} else {
+			go successfulLDAPServer(server, call)
+		}
+		return client, nil
+	}}
+	config := anonymousTestConfig(dialer)
+	config.MaxOpen = 1
+	config.MaxIdle = 1
+	pool, err := New(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.WithConnection(contextWithTimeout(t), func(*Connection) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	close(closeFirstPeer)
+	waitForCondition(t, func() bool {
+		pool.mu.Lock()
+		defer pool.mu.Unlock()
+		for _, physical := range pool.physical {
+			if client, ok := physical.client.(*ldap.Conn); ok && client.IsClosing() {
+				return true
+			}
+		}
+		return false
+	})
+	err = pool.WithConnection(contextWithTimeout(t), func(connection *Connection) error {
+		_, searchErr := connection.Search(context.Background(), ldap.NewSearchRequest(
+			"dc=x", ldap.ScopeBaseObject, ldap.NeverDerefAliases, 1, 1, false, "(objectClass=*)", nil, nil,
+		))
+		return searchErr
+	})
+	if !errors.Is(err, ErrNotSent) || !errors.Is(err, ErrTransport) || errors.Is(err, ErrOutcomeUnknown) {
+		t.Fatalf("idle-close operation = %v", err)
+	}
+	if err := pool.WithConnection(contextWithTimeout(t), func(connection *Connection) error {
+		_, searchErr := connection.Search(context.Background(), ldap.NewSearchRequest(
+			"dc=x", ldap.ScopeBaseObject, ldap.NeverDerefAliases, 1, 1, false, "(objectClass=*)", nil, nil,
+		))
+		return searchErr
+	}); err != nil {
+		t.Fatalf("replacement connection failed: %v", err)
+	}
+	if dialer.count() != 2 {
+		t.Fatalf("idle-close recovery dial count = %d, want 2", dialer.count())
 	}
 	if err := pool.Close(contextWithTimeout(t)); err != nil {
 		t.Fatal(err)

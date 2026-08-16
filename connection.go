@@ -309,6 +309,7 @@ func runOperation[T any](
 	if leaseState(connection.state.Load()) != leaseBusy {
 		trace.cancel()
 		connection.physical.transport.end(trace)
+		trace.destroy()
 		return zero, notSentError(op, ErrLeaseInvalid)
 	}
 	resultChannel := make(chan workerResult[T], 1)
@@ -353,6 +354,7 @@ func executeLDAPOperation[T any](
 	terminal *atomic.Uint32,
 	resultChannel chan<- workerResult[T],
 ) {
+	defer trace.destroy()
 	var value T
 	var rawErr error
 	dependencyPanic := false
@@ -415,39 +417,18 @@ func assessOperation(op Operation, write bool, rawErr error, trace traceSnapshot
 	if dependencyPanic {
 		return fatalOperation(op, write, dispatched, rawErr, ErrDependencyPanic, ReasonDependencyPanic)
 	}
-	if rawErr == nil {
-		if !dispatched {
-			return fatalOperation(
-				op, write, false, errors.New("LDAP operation returned success without dispatch"), ErrProtocol, ReasonProtocol,
-			)
-		}
-		if trace.writeInFlight != 0 {
-			return fatalOperation(
-				op, write, true, errors.New("LDAP operation returned while a transport write was active"), ErrTransport, ReasonTransport,
-			)
-		}
-		if trace.writeErr != nil || trace.readErr != nil {
-			return operationAssessment{fatal: true, reason: ReasonTransport}
-		}
-		return operationAssessment{}
-	}
 
 	var ldapErr *ldap.Error
-	if errors.As(rawErr, &ldapErr) && ldapErrorHasResponseTag(ldapErr, expectedResponseTag(op)) && isServerResultCode(ldapErr.ResultCode) {
-		operationErr := &OperationError{
-			Operation: op, Delivery: DeliveryConfirmed, Code: ldapErr.ResultCode, HasCode: true,
-			Cause: sanitizedLDAPError(ldapErr.ResultCode),
-		}
-		assessment := operationAssessment{err: operationErr}
-		if transportFailed {
-			assessment.fatal = true
-			assessment.reason = ReasonTransport
-			operationErr.kinds = []error{ErrTransport}
-			operationErr.Cause = errors.Join(operationErr.Cause, trace.writeErr, trace.readErr)
-		}
-		return assessment
+	networkWithoutPacket := errors.As(rawErr, &ldapErr) && ldapErr.ResultCode == ldap.ErrorNetwork && ldapErr.Packet == nil
+	if rawErr == nil && !dispatched {
+		return fatalOperation(
+			op, write, false, errors.New("LDAP operation returned success without dispatch"), ErrProtocol, ReasonProtocol,
+		)
 	}
 	if !dispatched && trace.writeInFlight == 0 {
+		if networkWithoutPacket {
+			return fatalOperation(op, write, false, rawErr, ErrTransport, ReasonTransport)
+		}
 		operationErr := &OperationError{
 			Operation: op, Delivery: DeliveryNotSent,
 			Cause: errors.New("LDAP request was rejected locally"), kinds: []error{ErrNotSent},
@@ -461,15 +442,58 @@ func assessOperation(op Operation, write bool, rawErr error, trace traceSnapshot
 		return assessment
 	}
 
-	reason := ReasonProtocol
-	kind := ErrProtocol
-	cause := errors.New("LDAP response validation failed; diagnostic redacted")
-	if trace.readErr != nil || trace.writeErr != nil || (errors.As(rawErr, &ldapErr) && ldapErr.ResultCode == ldap.ErrorNetwork && ldapErr.Packet == nil) {
-		reason = ReasonTransport
-		kind = ErrTransport
-		cause = errors.Join(rawErr, trace.writeErr, trace.readErr)
+	inspection := inspectOperationExchange(op, trace)
+	defer inspection.destroy()
+	if inspection.err != nil {
+		return fatalOperation(
+			op, write, true, protocolFailure("LDAP response validation failed"), ErrProtocol, ReasonProtocol,
+		)
 	}
-	return fatalOperation(op, write, true, cause, kind, reason)
+	if !inspection.complete {
+		if transportFailed || networkWithoutPacket {
+			return fatalOperation(op, write, true, errors.Join(rawErr, trace.writeErr, trace.readErr), ErrTransport, ReasonTransport)
+		}
+		return fatalOperation(
+			op, write, true, protocolFailure("LDAP operation returned without a complete response"), ErrProtocol, ReasonProtocol,
+		)
+	}
+	success, failureCode, hasFailure, resultErr := operationResultStatus(op, inspection.results)
+	if resultErr != nil {
+		return fatalOperation(op, write, true, protocolFailure("LDAP response used an invalid result code"), ErrProtocol, ReasonProtocol)
+	}
+	if rawErr == nil {
+		if !success || hasFailure {
+			return fatalOperation(op, write, true, protocolFailure("LDAP dependency accepted an error result as success"), ErrProtocol, ReasonProtocol)
+		}
+		if trace.writeInFlight != 0 {
+			return fatalOperation(
+				op, write, true, errors.New("LDAP operation returned while a transport write was active"), ErrTransport, ReasonTransport,
+			)
+		}
+		if transportFailed {
+			return operationAssessment{fatal: true, reason: ReasonTransport}
+		}
+		return operationAssessment{}
+	}
+	if success || !hasFailure {
+		return fatalOperation(op, write, true, protocolFailure("LDAP dependency returned an error after a successful result"), ErrProtocol, ReasonProtocol)
+	}
+	if failureCode < 0 || failureCode > int64(^uint16(0)) {
+		return fatalOperation(op, write, true, protocolFailure("LDAP result code exceeds the public result-code range"), ErrProtocol, ReasonProtocol)
+	}
+	code := uint16(failureCode)
+	operationErr := &OperationError{
+		Operation: op, Delivery: DeliveryConfirmed, Code: code, HasCode: true,
+		Cause: sanitizedLDAPError(code),
+	}
+	assessment := operationAssessment{err: operationErr}
+	if transportFailed {
+		assessment.fatal = true
+		assessment.reason = ReasonTransport
+		operationErr.kinds = []error{ErrTransport}
+		operationErr.Cause = errors.Join(operationErr.Cause, trace.writeErr, trace.readErr)
+	}
+	return assessment
 }
 
 func expectedResponseTag(op Operation) uint64 {

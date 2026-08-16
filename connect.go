@@ -203,14 +203,11 @@ func (p *Pool) runConnect(attempt *connectAttempt) {
 			p.emit(Event{Type: EventTLSFailure, Stage: StageTLS, Reason: ReasonTLSValidation, Duration: p.now().Sub(started)})
 			return
 		}
-		client = ldap.NewConn(tlsConn, true)
+		client = ldap.NewConn(newProtocolConn(tlsConn, &transport.active), true)
 		client.Start()
 	case TLSStartTLS:
 		stage = StageTLS
-		client = ldap.NewConn(transport, false)
-		client.SetTimeout(remainingTimeout(attempt.ctx, p.cfg.connectTimeout))
-		client.Start()
-		if err = client.StartTLS(p.cfg.tlsClone()); err != nil {
+		if err = requestStartTLS(transport); err != nil {
 			finished = true
 			failure := &connectFailure{stage: StageTLS, reason: ReasonTLSValidation, cause: sanitizeLDAPDiagnostic(err)}
 			p.guard.abort(attempt.permit)
@@ -218,7 +215,16 @@ func (p *Pool) runConnect(attempt *connectAttempt) {
 			p.emit(Event{Type: EventTLSFailure, Stage: StageTLS, Reason: ReasonTLSValidation, Duration: p.now().Sub(started)})
 			return
 		}
-		if state, ok := client.TLSConnectionState(); !ok || !state.HandshakeComplete {
+		tlsConn := tls.Client(transport, p.cfg.tlsClone())
+		if err = tlsConn.HandshakeContext(attempt.ctx); err != nil {
+			finished = true
+			failure := &connectFailure{stage: StageTLS, reason: ReasonTLSValidation, cause: err}
+			p.guard.abort(attempt.permit)
+			p.finishConnectFailure(attempt, transport, client, failure)
+			p.emit(Event{Type: EventTLSFailure, Stage: StageTLS, Reason: ReasonTLSValidation, Duration: p.now().Sub(started)})
+			return
+		}
+		if !tlsConn.ConnectionState().HandshakeComplete {
 			finished = true
 			failure := &connectFailure{stage: StageTLS, reason: ReasonTLSValidation, cause: errors.New("StartTLS did not produce a verified TLS session")}
 			p.guard.abort(attempt.permit)
@@ -226,8 +232,10 @@ func (p *Pool) runConnect(attempt *connectAttempt) {
 			p.emit(Event{Type: EventTLSFailure, Stage: StageTLS, Reason: ReasonTLSValidation, Duration: p.now().Sub(started)})
 			return
 		}
+		client = ldap.NewConn(newProtocolConn(tlsConn, &transport.active), true)
+		client.Start()
 	case TLSPlaintext:
-		client = ldap.NewConn(transport, false)
+		client = ldap.NewConn(newProtocolConn(transport, &transport.active), false)
 		client.Start()
 	}
 
@@ -250,21 +258,33 @@ func (p *Pool) runConnect(attempt *connectAttempt) {
 		stage = StageBind
 		client.SetTimeout(remainingTimeout(attempt.ctx, p.cfg.connectTimeout))
 		trace := transport.begin()
+		defer trace.destroy()
 		_, bindErr := client.SimpleBind(&ldap.SimpleBindRequest{
 			Username: p.cfg.bindPrincipal,
 			Password: string(attempt.password),
 		})
 		bindTrace := transport.end(trace)
-		if bindErr != nil {
-			decision, panicErr := classifyCredential(p.cfg.classifier, bindErr)
+		inspection := inspectBindExchange(bindTrace)
+		defer inspection.destroy()
+		var bindResult *strictLDAPResult
+		if len(inspection.results) == 1 {
+			bindResult = inspection.results[0]
+		}
+		if bindResult != nil && bindResult.code != ldap.LDAPResultSuccess {
+			decision, panicErr := classifyCredentialResult(p.cfg.classifier, bindResult)
 			guard := p.guard.bindFailed(attempt.permit, decision, p.now(), p.random())
 			eventReason := ReasonBind
 			finished = true
 			if panicErr != nil {
 				p.emit(Event{Type: EventDependencyPanic, Stage: StageBind, Reason: ReasonDependencyPanic})
 			}
+			resultCause := sanitizedStrictLDAPResult(bindResult.code)
+			if inspection.err != nil {
+				eventReason = ReasonProtocol
+				resultCause = errors.Join(resultCause, protocolFailure("LDAP Bind response validation failed"))
+			}
 			if decision.Action == CredentialNotCredential {
-				reason, cause := assessBindFailure(bindErr, bindTrace)
+				reason, cause := eventReason, resultCause
 				eventReason = reason
 				failure := &connectFailure{stage: StageBind, reason: reason, cause: cause}
 				p.finishConnectFailure(attempt, transport, client, failure)
@@ -272,19 +292,41 @@ func (p *Pool) runConnect(attempt *connectAttempt) {
 				state := guard.state
 				cause := &CredentialError{
 					State: state, Reason: guard.reason, RetryAt: guard.retryAt,
-					Cause: errors.Join(sanitizeBindError(bindErr), panicErr),
+					Cause: errors.Join(resultCause, panicErr),
 				}
-				failure := &connectFailure{stage: StageBind, reason: ReasonBind, cause: cause, credential: true, retryAt: guard.retryAt}
+				failure := &connectFailure{stage: StageBind, reason: eventReason, cause: cause, credential: true, retryAt: guard.retryAt}
 				p.finishConnectFailure(attempt, transport, client, failure)
 				p.emit(Event{Type: EventCredentialState, Stage: StageBind, CredentialState: guard.state, CredentialReason: guard.reason, RetryAt: guard.retryAt})
 			}
 			p.emit(Event{Type: EventBindFailure, Stage: StageBind, Reason: eventReason, CredentialState: guard.state, CredentialReason: guard.reason, RetryAt: guard.retryAt, Duration: p.now().Sub(started)})
 			return
 		}
-		if failure := validateBindSuccess(bindTrace); failure != nil {
+		if inspection.err != nil || !inspection.complete || bindResult == nil || bindResult.code != ldap.LDAPResultSuccess {
+			finished = true
+			p.guard.abort(attempt.permit)
+			reason, cause := assessBindFailure(bindErr, bindTrace)
+			if len(bindTrace.responses.messages) > 0 || reason != ReasonTransport {
+				reason = ReasonProtocol
+				cause = protocolFailure("LDAP Bind response validation failed")
+			}
+			failure := &connectFailure{stage: StageBind, reason: reason, cause: cause}
+			p.finishConnectFailure(attempt, transport, client, failure)
+			p.emit(Event{Type: EventBindFailure, Stage: StageBind, Reason: reason, Duration: p.now().Sub(started)})
+			return
+		}
+		if failure := validateBindTransport(bindTrace); failure != nil {
 			finished = true
 			p.guard.abort(attempt.permit)
 			p.finishConnectFailure(attempt, transport, client, failure)
+			p.emit(Event{Type: EventBindFailure, Stage: StageBind, Reason: ReasonTransport, Duration: p.now().Sub(started)})
+			return
+		}
+		if bindErr != nil {
+			finished = true
+			p.guard.abort(attempt.permit)
+			failure := &connectFailure{stage: StageBind, reason: ReasonProtocol, cause: protocolFailure("LDAP dependency rejected a valid Bind response")}
+			p.finishConnectFailure(attempt, transport, client, failure)
+			p.emit(Event{Type: EventBindFailure, Stage: StageBind, Reason: ReasonProtocol, Duration: p.now().Sub(started)})
 			return
 		}
 		guard := p.guard.bindSucceeded(attempt.permit)
@@ -549,32 +591,18 @@ func remainingTimeout(ctx context.Context, fallback time.Duration) time.Duration
 	return fallback
 }
 
-func sanitizeBindError(err error) error {
-	var ldapErr *ldap.Error
-	if errors.As(err, &ldapErr) {
-		return sanitizedLDAPError(ldapErr.ResultCode)
+func validateBindTransport(trace traceSnapshot) *connectFailure {
+	if trace.writeInFlight == 0 && trace.writeErr == nil && trace.readErr == nil {
+		return nil
 	}
-	return errors.New("LDAP Bind failed; diagnostic redacted")
-}
-
-func validateBindSuccess(trace traceSnapshot) *connectFailure {
-	if trace.writtenBytes == 0 {
-		return &connectFailure{
-			stage: StageBind, reason: ReasonProtocol,
-			cause: errors.New("LDAP Bind returned success without a dispatched request"),
-		}
+	return &connectFailure{
+		stage: StageBind, reason: ReasonTransport,
+		cause: errors.Join(
+			errors.New("LDAP Bind succeeded but the transport became unusable"),
+			trace.writeErr,
+			trace.readErr,
+		),
 	}
-	if trace.writeErr != nil || trace.readErr != nil || trace.writeInFlight != 0 {
-		return &connectFailure{
-			stage: StageBind, reason: ReasonTransport,
-			cause: errors.Join(
-				errors.New("LDAP Bind succeeded but the transport became unusable"),
-				trace.writeErr,
-				trace.readErr,
-			),
-		}
-	}
-	return nil
 }
 
 func assessBindFailure(err error, trace traceSnapshot) (FailureReason, error) {

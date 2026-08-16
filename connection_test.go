@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -337,6 +338,37 @@ func TestCallbackPanicCleansUpThenPropagates(t *testing.T) {
 	}
 }
 
+func TestCallbackGoexitCleansUpWithoutPanicking(t *testing.T) {
+	dialer := &testDialer{factory: pipeFactory(successfulLDAPServer, nil)}
+	pool, err := New(anonymousTestConfig(dialer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered := make(chan any, 1)
+	done := make(chan struct{})
+	ctx := contextWithTimeout(t)
+	go func() {
+		defer func() {
+			recovered <- recover()
+			close(done)
+		}()
+		_ = pool.WithConnection(ctx, func(*Connection) error {
+			runtime.Goexit()
+			return nil
+		})
+	}()
+	receive(t, done)
+	if value := receive(t, recovered); value != nil {
+		t.Fatalf("runtime.Goexit became panic: %v", value)
+	}
+	if snapshot := pool.Snapshot(); snapshot.Counts.Open != 0 {
+		t.Fatalf("Goexit callback retained connection: %+v", snapshot.Counts)
+	}
+	if err := pool.Close(contextWithTimeout(t)); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestServerRejectionRemainsHealthyEvenWhenCallbackSwallowsError(t *testing.T) {
 	handler := func(conn net.Conn, _ int) {
 		defer conn.Close()
@@ -470,6 +502,180 @@ func TestEveryWriteReportsUnknownAfterDispatchLoss(t *testing.T) {
 			}
 			if pool.Snapshot().Counts.Open != 0 {
 				t.Fatal("ambiguous write connection remained open")
+			}
+			if err := pool.Close(contextWithTimeout(t)); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestEveryWriteRejectsTruncatedNonzeroResultCode(t *testing.T) {
+	tests := []struct {
+		name string
+		call func(context.Context, *Connection) error
+	}{
+		{"Add", func(ctx context.Context, connection *Connection) error {
+			request := ldap.NewAddRequest("cn=x", nil)
+			request.Attribute("objectClass", []string{"top"})
+			return connection.Add(ctx, request)
+		}},
+		{"Modify", func(ctx context.Context, connection *Connection) error {
+			request := ldap.NewModifyRequest("cn=x", nil)
+			request.Replace("description", []string{"x"})
+			return connection.Modify(ctx, request)
+		}},
+		{"Delete", func(ctx context.Context, connection *Connection) error {
+			return connection.Del(ctx, ldap.NewDelRequest("cn=x", nil))
+		}},
+		{"ModifyDN", func(ctx context.Context, connection *Connection) error {
+			return connection.ModifyDN(ctx, ldap.NewModifyDNRequest("cn=x", "cn=y", true, ""))
+		}},
+		{"PasswordModify", func(ctx context.Context, connection *Connection) error {
+			_, err := connection.PasswordModify(ctx, ldap.NewPasswordModifyRequest("cn=x", "old", "new"))
+			return err
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dialer := &testDialer{factory: pipeFactory(func(conn net.Conn, _ int) {
+				defer conn.Close()
+				reader := bufio.NewReader(conn)
+				request, err := readLDAPRequest(reader)
+				if err != nil {
+					return
+				}
+				_ = writeLDAPResultCode(conn, request.messageID, responseTag(request.tag), 65536, "")
+				_, _ = readLDAPRequest(reader)
+			}, nil)}
+			pool, err := New(anonymousTestConfig(dialer))
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = pool.WithConnection(contextWithTimeout(t), func(connection *Connection) error {
+				return test.call(context.Background(), connection)
+			})
+			if !errors.Is(err, ErrProtocol) || !errors.Is(err, ErrOutcomeUnknown) || errors.Is(err, ErrNotSent) {
+				t.Fatalf("truncated result code was accepted: %v", err)
+			}
+			if err := pool.Close(contextWithTimeout(t)); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestWriteRejectsMalformedSuccessfulLDAPResult(t *testing.T) {
+	tests := []struct {
+		name       string
+		resultCode []byte
+		matchedDN  []byte
+	}{
+		{"wrong matchedDN tag", berInteger(0x0a, 0), berInteger(0x02, 0)},
+		{"oversized resultCode", berTLV(0x0a, make([]byte, 9)), berOctet(nil)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dialer := &testDialer{factory: pipeFactory(func(conn net.Conn, _ int) {
+				defer conn.Close()
+				reader := bufio.NewReader(conn)
+				request, err := readLDAPRequest(reader)
+				if err != nil {
+					return
+				}
+				_ = writeLDAPResultElements(conn, request.messageID, ldap.ApplicationAddResponse,
+					test.resultCode, test.matchedDN, berOctet(nil))
+				_, _ = readLDAPRequest(reader)
+			}, nil)}
+			pool, err := New(anonymousTestConfig(dialer))
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = pool.WithConnection(contextWithTimeout(t), func(connection *Connection) error {
+				request := ldap.NewAddRequest("cn=x", nil)
+				request.Attribute("objectClass", []string{"top"})
+				return connection.Add(context.Background(), request)
+			})
+			if !errors.Is(err, ErrProtocol) || !errors.Is(err, ErrOutcomeUnknown) {
+				t.Fatalf("malformed LDAPResult was accepted: %v", err)
+			}
+			if err := pool.Close(contextWithTimeout(t)); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestCompareRejectsSuccessResultCode(t *testing.T) {
+	dialer := &testDialer{factory: pipeFactory(func(conn net.Conn, _ int) {
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		request, err := readLDAPRequest(reader)
+		if err == nil {
+			_ = writeLDAPResult(conn, request.messageID, ldap.ApplicationCompareResponse, ldap.LDAPResultSuccess, "")
+			_, _ = readLDAPRequest(reader)
+		}
+	}, nil)}
+	pool, err := New(anonymousTestConfig(dialer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = pool.WithConnection(contextWithTimeout(t), func(connection *Connection) error {
+		matched, compareErr := connection.Compare(context.Background(), "cn=x", "uid", "x")
+		if matched {
+			t.Fatal("Compare returned true for success resultCode")
+		}
+		return compareErr
+	})
+	if !errors.Is(err, ErrProtocol) || errors.Is(err, ErrNotSent) {
+		t.Fatalf("Compare success resultCode = %v", err)
+	}
+	if err := pool.Close(contextWithTimeout(t)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSearchOperationsRejectTruncatedNonzeroResultCode(t *testing.T) {
+	newRequest := func() *ldap.SearchRequest {
+		return ldap.NewSearchRequest("dc=x", ldap.ScopeBaseObject, ldap.NeverDerefAliases, 1, 1, false, "(objectClass=*)", nil, nil)
+	}
+	tests := []struct {
+		name string
+		call func(context.Context, *Connection) error
+	}{
+		{"Search", func(ctx context.Context, connection *Connection) error {
+			_, err := connection.Search(ctx, newRequest())
+			return err
+		}},
+		{"SearchWithPaging", func(ctx context.Context, connection *Connection) error {
+			_, err := connection.SearchWithPaging(ctx, newRequest(), 10)
+			return err
+		}},
+		{"DirSync", func(ctx context.Context, connection *Connection) error {
+			_, err := connection.DirSync(ctx, newRequest(), 0, 0, nil)
+			return err
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dialer := &testDialer{factory: pipeFactory(func(conn net.Conn, _ int) {
+				defer conn.Close()
+				reader := bufio.NewReader(conn)
+				request, err := readLDAPRequest(reader)
+				if err == nil {
+					_ = writeLDAPResultCode(conn, request.messageID, ldap.ApplicationSearchResultDone, 65536, "")
+					_, _ = readLDAPRequest(reader)
+				}
+			}, nil)}
+			pool, err := New(anonymousTestConfig(dialer))
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = pool.WithConnection(contextWithTimeout(t), func(connection *Connection) error {
+				return test.call(context.Background(), connection)
+			})
+			if !errors.Is(err, ErrProtocol) || errors.Is(err, ErrOutcomeUnknown) || errors.Is(err, ErrNotSent) {
+				t.Fatalf("truncated search result code was accepted: %v", err)
 			}
 			if err := pool.Close(contextWithTimeout(t)); err != nil {
 				t.Fatal(err)

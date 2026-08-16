@@ -7,7 +7,8 @@ security policy, and fixed authentication identity.
 The API deliberately prevents callers from rebinding, changing TLS state,
 closing a shared connection, or retaining the underlying `ldap.Client`.
 
-> Status: v0.1 release candidate. The API is under validation until v1.0.0.
+> Status: alpha/experimental. The API is under validation until v1.0.0, and
+> prereleases are not recommended for production use.
 
 ## Requirements
 
@@ -20,8 +21,13 @@ closing a shared connection, or retaining the underlying `ldap.Client`.
 ## Install
 
 ```sh
-go get github.com/imbrooklyn/ldappool@latest
+go get github.com/imbrooklyn/ldappool@v0.1.0-alpha
 ```
+
+Pin an exact tag you have reviewed; the command above selects the historical
+alpha for reproducibility, not as a production recommendation. Substitute a
+newer reviewed prerelease after one is published, and do not rely on `@latest`
+while the module is experimental.
 
 ## Why this package
 
@@ -33,7 +39,7 @@ go get github.com/imbrooklyn/ldappool@latest
 - Idle and lifetime eviction with exact `MaxOpen` accounting, including
   connections whose physical close is still running.
 - Pool-owned connection establishment, bounded exponential backoff, and a
-  process-local credential guard.
+  per-pool, in-process credential guard.
 - Callback-scoped leases that become invalid after return and reject concurrent
   operations.
 - Explicit write outcome semantics: an update that may have reached the server
@@ -201,8 +207,9 @@ Ordinary connection backoff limits only new dials. It never prevents reuse of
 an already healthy connection. If a healthy connection is borrowed, a waiter
 remains queued for its return even while creation is delayed.
 
-The credential guard is process-local. The conservative default treats Busy and
-Unavailable as ordinary connection failures; it blocks future Bind attempts for
+The credential guard is owned by one `Pool` and is not coordinated with other
+pools in the same process. The conservative default treats Busy and Unavailable
+as ordinary connection failures; it blocks future Bind attempts for
 invalid credentials, unsupported or inappropriate authentication,
 security-policy failures, and unknown complete Bind results. A custom
 `CredentialFailureClassifier` can implement vendor policy. Its raw diagnostic

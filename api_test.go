@@ -62,7 +62,7 @@ func TestProductionImportBoundary(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !strings.Contains(path, ".") || path == "github.com/go-ldap/ldap/v3" {
+			if !strings.Contains(path, ".") || path == "github.com/go-ldap/ldap/v3" || path == "github.com/go-asn1-ber/asn1-ber" {
 				continue
 			}
 			forbidden = append(forbidden, name+":"+path)

@@ -186,6 +186,55 @@ func TestStartTLSSucceedsBeforeLDAPUse(t *testing.T) {
 	}
 }
 
+func TestStartTLSBindStillRequiresBindResponse(t *testing.T) {
+	certificate, roots := testCertificate(t, []string{"ldap.example.test"}, nil)
+	dialer := &testDialer{factory: func(_ context.Context, _ int) (net.Conn, error) {
+		client, server := net.Pipe()
+		go func() {
+			defer server.Close()
+			reader := bufio.NewReader(server)
+			startTLS, err := readLDAPRequest(reader)
+			if err != nil || startTLS.tag != ldap.ApplicationExtendedRequest {
+				return
+			}
+			if writeLDAPResult(server, startTLS.messageID, ldap.ApplicationExtendedResponse, ldap.LDAPResultSuccess, "") != nil {
+				return
+			}
+			tlsServer := tls.Server(server, &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12})
+			if tlsServer.Handshake() != nil {
+				return
+			}
+			bind, err := readLDAPRequest(bufio.NewReader(tlsServer))
+			if err == nil {
+				_ = writeLDAPResult(tlsServer, bind.messageID, ldap.ApplicationAddResponse, ldap.LDAPResultSuccess, "")
+			}
+		}()
+		return client, nil
+	}}
+	pool, err := New(Config{
+		Endpoint: "ldap://ldap.example.test:389",
+		TLS:      TLSConfig{Mode: TLSStartTLS, RootCAs: roots},
+		Auth: AuthConfig{
+			Mode: AuthSimple, BindPrincipal: "cn=service", Password: NewSecret([]byte("secret")),
+		},
+		Dialer: dialer, ConnectTimeout: testTimeout, RequestTimeout: testTimeout, CloseTimeout: testTimeout,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	callbackCalled := false
+	err = pool.WithConnection(contextWithTimeout(t), func(*Connection) error {
+		callbackCalled = true
+		return nil
+	})
+	if !errors.Is(err, ErrProtocol) || callbackCalled {
+		t.Fatalf("StartTLS wrong-tag Bind success = %v, callback=%v", err, callbackCalled)
+	}
+	if err := pool.Close(contextWithTimeout(t)); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestStartTLSRejectionNeverContinuesToBind(t *testing.T) {
 	requests := make(chan byte, 2)
 	dialer := &testDialer{factory: func(_ context.Context, _ int) (net.Conn, error) {

@@ -20,7 +20,7 @@ const (
 	PoolClosed            PoolState = "closed"
 )
 
-// CredentialState is the process-local credential guard state.
+// CredentialState is one Pool's in-process credential guard state.
 type CredentialState string
 
 const (

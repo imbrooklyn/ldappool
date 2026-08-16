@@ -110,6 +110,8 @@ func FuzzCredentialGuardCommandSequence(f *testing.F) {
 
 func FuzzMalformedLDAPResponseNeverEscapesPanic(f *testing.F) {
 	f.Add([]byte{0x30, 0x0c, 0x02, 0x01, 0x01, 0x65, 0x07, 0x0a, 0x01, 0x00, 0x04, 0x00, 0x04, 0x00})
+	f.Add([]byte{0x30, 0x0e, 0x02, 0x01, 0x01, 0x65, 0x09, 0x0a, 0x03, 0x01, 0x00, 0x00, 0x04, 0x00, 0x04, 0x00})
+	f.Add([]byte{0x30, 0x0d, 0x02, 0x01, 0x01, 0x65, 0x08, 0x0a, 0x01, 0x00, 0x02, 0x01, 0x00, 0x04, 0x00})
 	f.Add([]byte{0x30, 0x80, 0xff, 0x00})
 	f.Add([]byte("not-ber"))
 	f.Fuzz(func(t *testing.T, response []byte) {
@@ -133,16 +135,36 @@ func FuzzMalformedLDAPResponseNeverEscapesPanic(f *testing.F) {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		_ = pool.WithConnection(ctx, func(connection *Connection) error {
+		operationErr := pool.WithConnection(ctx, func(connection *Connection) error {
 			_, searchErr := connection.Search(ctx, ldap.NewSearchRequest(
 				"dc=example", ldap.ScopeBaseObject, ldap.NeverDerefAliases, 1, 1,
 				false, "(objectClass=*)", nil, nil,
 			))
 			return searchErr
 		})
+		if operationErr == nil && !isStrictSearchSuccessWireResponse(response) {
+			t.Fatal("malformed LDAP response was accepted as Search success")
+		}
 		if err := pool.Close(ctx); err != nil {
 			t.Fatal(err)
 		}
 		assertClosedPoolInvariants(t, pool)
 	})
+}
+
+func isStrictSearchSuccessWireResponse(response []byte) bool {
+	var stream ldapMessageStream
+	stream.feed(response)
+	inspection := inspectOperationExchange(OperationSearch, traceSnapshot{
+		requests: ldapStreamSnapshot{messages: []ldapMessageObservation{{
+			messageID: 1, applicationTag: ldap.ApplicationSearchRequest, constructed: true,
+		}}},
+		responses: stream.snapshot(),
+	})
+	defer inspection.destroy()
+	if inspection.err != nil || !inspection.complete {
+		return false
+	}
+	success, _, hasFailure, err := operationResultStatus(OperationSearch, inspection.results)
+	return err == nil && success && !hasFailure
 }

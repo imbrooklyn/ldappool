@@ -6,6 +6,21 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Strictly validate Bind and operation response tags, complete LDAPResult
+  structure, untruncated result codes, and operation-specific success codes.
+- Preserve credential protection when a Bind result is followed by malformed
+  response controls.
+- Evict connections already closed by the LDAP reader while preserving
+  `ErrNotSent` for an operation that wrote no request bytes.
+- Preserve `runtime.Goexit` control flow while retiring the interrupted lease.
+
+### Changed
+
+- Describe the prerelease as alpha/experimental and clarify that credential
+  guard state is per-pool rather than process-wide.
+
 ## [0.1.0-alpha] - 2026-08-16
 
 ### Added
@@ -17,8 +32,8 @@ All notable changes to this project are documented here. The format follows
   ModifyDN, and PasswordModify operations.
 - Context cancellation, operation deadlines, transport eviction, precise write
   outcome classification, and no automatic operation retries.
-- Connection and credential exponential backoff with jitter, process-local
-  credential protection, half-open probing, and password rotation.
+- Connection and credential exponential backoff with jitter, per-pool
+  in-process credential protection, half-open probing, and password rotation.
 - Idle-time and lifetime eviction, bounded waiter and connection counts,
   graceful Close, and ForceClose.
 - Passive redacted snapshots and an optional bounded asynchronous observer.

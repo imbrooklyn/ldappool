@@ -243,6 +243,13 @@ func sanitizedLDAPError(code uint16) error {
 	return ldap.NewError(code, errors.New("LDAP server returned a result error; diagnostic redacted"))
 }
 
+func sanitizedStrictLDAPResult(code int64) error {
+	if code >= 0 && code <= int64(^uint16(0)) {
+		return sanitizedLDAPError(uint16(code))
+	}
+	return errors.New("LDAP server returned an unsupported result code; diagnostic redacted")
+}
+
 func ldapErrorHasResponseTag(err *ldap.Error, expected uint64) bool {
 	return err != nil && err.Packet != nil && len(err.Packet.Children) >= 2 &&
 		err.Packet.Children[1] != nil && uint64(err.Packet.Children[1].Tag) == expected

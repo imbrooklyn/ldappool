@@ -227,8 +227,23 @@ func responseTag(requestTag byte) byte {
 }
 
 func writeLDAPResult(writer io.Writer, messageID int64, applicationTag byte, code uint16, diagnostic string) error {
-	result := append(berInteger(0x0a, int64(code)), berOctet(nil)...)
+	return writeLDAPResultCode(writer, messageID, applicationTag, int64(code), diagnostic)
+}
+
+func writeLDAPResultCode(writer io.Writer, messageID int64, applicationTag byte, code int64, diagnostic string) error {
+	result := append(berInteger(0x0a, code), berOctet(nil)...)
 	result = append(result, berOctet([]byte(diagnostic))...)
+	response := berTLV(0x60|applicationTag, result)
+	message := append(berInteger(0x02, messageID), response...)
+	_, err := writer.Write(berTLV(0x30, message))
+	return err
+}
+
+func writeLDAPResultElements(writer io.Writer, messageID int64, applicationTag byte, elements ...[]byte) error {
+	var result []byte
+	for _, element := range elements {
+		result = append(result, element...)
+	}
 	response := berTLV(0x60|applicationTag, result)
 	message := append(berInteger(0x02, messageID), response...)
 	_, err := writer.Write(berTLV(0x30, message))

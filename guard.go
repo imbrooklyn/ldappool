@@ -244,6 +244,23 @@ func classifyCredential(classifier CredentialFailureClassifier, err error) (deci
 	if ldapErr.Err != nil {
 		failure.Diagnostic = ldapErr.Err.Error()
 	}
+	return classifyCredentialFailure(classifier, failure)
+}
+
+func classifyCredentialResult(classifier CredentialFailureClassifier, result *strictLDAPResult) (CredentialDecision, error) {
+	if result == nil || result.code <= 0 {
+		return CredentialDecision{Action: CredentialNotCredential}, nil
+	}
+	if result.code > int64(^uint16(0)) {
+		return CredentialDecision{Action: CredentialBlock, Reason: CredentialReasonUnknown}, nil
+	}
+	return classifyCredentialFailure(classifier, CredentialFailure{
+		ResultCode: uint16(result.code),
+		Diagnostic: string(result.diagnostic),
+	})
+}
+
+func classifyCredentialFailure(classifier CredentialFailureClassifier, failure CredentialFailure) (decision CredentialDecision, panicErr error) {
 	if classifier == nil {
 		return defaultCredentialDecision(failure), nil
 	}

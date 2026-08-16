@@ -172,12 +172,14 @@ func (p *Pool) WithConnection(ctx context.Context, callback func(*Connection) er
 	completed := false
 	defer func() {
 		panicValue := recover()
-		panicked := !completed
-		closeErr := p.releaseAndWait(connection, panicked)
-		if panicked {
+		abnormal := !completed
+		closeErr := p.releaseAndWait(connection, abnormal)
+		if panicValue != nil {
 			panic(panicValue)
 		}
-		returnErr = errors.Join(returnErr, closeErr)
+		if !abnormal {
+			returnErr = errors.Join(returnErr, closeErr)
+		}
 	}()
 	returnErr = callback(connection)
 	completed = true
@@ -324,7 +326,7 @@ func (p *Pool) RotateCredentials(secret Secret) error {
 	return nil
 }
 
-// ResetCredentialGuard explicitly clears the process-local credential guard.
+// ResetCredentialGuard explicitly clears this Pool's in-process credential guard.
 // It does not change credentials or revive existing connections.
 func (p *Pool) ResetCredentialGuard() error {
 	p.identityMu.Lock()

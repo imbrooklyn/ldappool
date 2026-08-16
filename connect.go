@@ -508,13 +508,13 @@ func (p *Pool) finishConnectFailure(attempt *connectAttempt, transport *trackedC
 }
 
 func (p *Pool) failWaitersIfNoOpen() {
-	guard := p.guard.snapshot()
 	now := p.now()
 	p.mu.Lock()
 	if p.lifecycle != poolRunning || p.open != 0 {
 		p.mu.Unlock()
 		return
 	}
+	guard := p.guard.snapshot()
 	err := p.immediateGateErrorLocked(now, guard)
 	if err == nil {
 		p.mu.Unlock()
@@ -529,12 +529,12 @@ func (p *Pool) failWaitersIfNoOpen() {
 }
 
 func (p *Pool) nextSchedulerWake() (time.Time, bool) {
-	guard := p.guard.snapshot()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.lifecycle != poolRunning {
 		return time.Time{}, false
 	}
+	guard := p.guard.snapshot()
 	var next time.Time
 	for _, physical := range p.idle {
 		if physical.state != connectionIdle {

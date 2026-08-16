@@ -6,12 +6,16 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.1] - 2026-08-17
+
 ### Fixed
 
 - Strictly validate Bind and operation response tags, complete LDAPResult
   structure, untruncated result codes, and operation-specific success codes.
 - Preserve credential protection when a Bind result is followed by malformed
   response controls.
+- Serialize credential resets with waiter gate decisions so stale blocked
+  state cannot reject an acquisition after manual reset or password rotation.
 - Evict connections already closed by the LDAP reader while preserving
   `ErrNotSent` for an operation that wrote no request bytes.
 - Preserve `runtime.Goexit` control flow while retiring the interrupted lease.
@@ -50,5 +54,6 @@ All notable changes to this project are documented here. The format follows
 - The release scan has no reachable or imported-package vulnerabilities;
   module-only GO-2026-5932 is documented as an unreachable residual risk.
 
-[Unreleased]: https://github.com/imbrooklyn/ldappool/compare/v0.1.0-alpha...HEAD
+[Unreleased]: https://github.com/imbrooklyn/ldappool/compare/v0.1.0-alpha.1...HEAD
+[0.1.0-alpha.1]: https://github.com/imbrooklyn/ldappool/compare/v0.1.0-alpha...v0.1.0-alpha.1
 [0.1.0-alpha]: https://github.com/imbrooklyn/ldappool/releases/tag/v0.1.0-alpha

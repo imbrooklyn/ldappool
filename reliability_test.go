@@ -499,7 +499,7 @@ func TestResetCredentialGuardAllowsExplicitProbe(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := pool.WithConnection(contextWithTimeout(t), func(*Connection) error { return nil }); err != nil {
-		t.Fatalf("manual reset did not allow probe: %v", err)
+		t.Fatalf("manual reset did not allow probe: %v, dials=%d, snapshot=%+v", err, dialer.count(), pool.Snapshot())
 	}
 	if dialer.count() != 2 {
 		t.Fatalf("dial count = %d, want 2", dialer.count())

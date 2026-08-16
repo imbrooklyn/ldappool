@@ -75,6 +75,7 @@ type poolState struct {
 	rootCtx    context.Context
 	rootCancel context.CancelFunc
 
+	// Nested lock order is identityMu, mu, then credential.mu or guard.mu.
 	mu sync.Mutex
 
 	lifecycle  poolLifecycle
@@ -285,6 +286,7 @@ func (p *Pool) RotateCredentials(secret Secret) error {
 	var closeList []*physicalConn
 	var cancelConnect context.CancelFunc
 	var oldPassword []byte
+	var guard guardSnapshot
 	p.mu.Lock()
 	if p.lifecycle != poolRunning {
 		p.mu.Unlock()
@@ -314,9 +316,9 @@ func (p *Pool) RotateCredentials(secret Secret) error {
 			}
 		}
 	}
+	guard = p.guard.reset(generation, CredentialReasonCredentialRotated)
 	p.mu.Unlock()
 	wipe(oldPassword)
-	guard := p.guard.reset(generation, CredentialReasonCredentialRotated)
 	if cancelConnect != nil {
 		cancelConnect()
 	}
@@ -336,9 +338,9 @@ func (p *Pool) ResetCredentialGuard() error {
 		p.mu.Unlock()
 		return ErrPoolClosed
 	}
-	p.mu.Unlock()
 	generation := p.credential.generation.Load()
 	guard := p.guard.reset(generation, CredentialReasonManualReset)
+	p.mu.Unlock()
 	p.signal()
 	p.emit(Event{Type: EventCredentialState, CredentialState: guard.state, CredentialReason: guard.reason})
 	return nil
@@ -399,7 +401,6 @@ func (p *Pool) acquire(ctx context.Context, internal bool) (*Connection, error) 
 		return nil, &AcquireError{Stage: StageAcquire, Cause: err}
 	}
 	now := p.now()
-	guard := p.guard.snapshot()
 	var expired []*physicalConn
 	p.mu.Lock()
 	if p.lifecycle != poolRunning {
@@ -421,6 +422,7 @@ func (p *Pool) acquire(ctx context.Context, internal bool) (*Connection, error) 
 		}
 	}
 	if p.open == 0 {
+		guard := p.guard.snapshot()
 		if err := p.immediateGateErrorLocked(now, guard); err != nil {
 			p.mu.Unlock()
 			p.startCloseAll(expired)

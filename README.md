@@ -21,13 +21,11 @@ closing a shared connection, or retaining the underlying `ldap.Client`.
 ## Install
 
 ```sh
-go get github.com/imbrooklyn/ldappool@v0.1.0-alpha
+go get github.com/imbrooklyn/ldappool@v0.1.0-alpha.1
 ```
 
-Pin an exact tag you have reviewed; the command above selects the historical
-alpha for reproducibility, not as a production recommendation. Substitute a
-newer reviewed prerelease after one is published, and do not rely on `@latest`
-while the module is experimental.
+Pin an exact tag you have reviewed, and do not rely on `@latest` while the
+module is experimental. Prereleases are not a production recommendation.
 
 ## Why this package
 

@@ -285,10 +285,6 @@ func inspectLDAPMessage(buffer []byte) (observation ldapMessageObservation) {
 	}
 	observation.applicationTag = uint64(protocolOp.tag)
 	observation.constructed = protocolOp.tagType == ber.TypeConstructed
-	if protocolOp.tagType != ber.TypePrimitive && protocolOp.tagType != ber.TypeConstructed {
-		observation.validationError = errors.New("LDAPMessage has an invalid protocol operation encoding")
-		return observation
-	}
 
 	if isLDAPResultResponse(observation.applicationTag) {
 		packet, decodeErr := ber.DecodePacketErr(protocolOp.raw)
@@ -495,7 +491,7 @@ func validateLDAPReferral(packet *ber.Packet) error {
 }
 
 func validateLDAPControls(packet *ber.Packet) error {
-	if !packetHasIdentifier(packet, ber.ClassContext, ber.TypeConstructed, 0) {
+	if !packetHasIdentifier(packet, ber.ClassContext, ber.TypeConstructed, 0) || len(packet.Children) == 0 {
 		return errors.New("LDAP controls field has an invalid identifier")
 	}
 	for _, control := range packet.Children {
@@ -724,12 +720,9 @@ func operationResultStatus(op Operation, results []*strictLDAPResult) (success b
 	}
 	for index, result := range results {
 		if result.code == ldap.LDAPResultSuccess {
-			if hasFailure {
-				return false, 0, false, errors.New("LDAP operation continued after an error result")
-			}
 			continue
 		}
-		if hasFailure || index != len(results)-1 {
+		if index != len(results)-1 {
 			return false, 0, false, errors.New("LDAP operation returned an invalid result sequence")
 		}
 		failureCode = result.code

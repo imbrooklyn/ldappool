@@ -26,6 +26,18 @@ func TestPublicPoolMethodSurface(t *testing.T) {
 	}
 }
 
+func TestPublicCredentialGuardMethodSurface(t *testing.T) {
+	typeOf := reflect.TypeOf((*CredentialGuard)(nil))
+	got := make([]string, 0, typeOf.NumMethod())
+	for i := 0; i < typeOf.NumMethod(); i++ {
+		got = append(got, typeOf.Method(i).Name)
+	}
+	want := []string{"GoString", "Reset", "RotateCredentials", "String"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("CredentialGuard methods = %v, want %v", got, want)
+	}
+}
+
 func TestSecuritySensitiveConfigurationSurface(t *testing.T) {
 	tlsType := reflect.TypeOf(TLSConfig{})
 	for _, forbidden := range []string{"InsecureSkipVerify", "VerifyPeerCertificate", "VerifyConnection"} {
@@ -76,7 +88,7 @@ func TestProductionImportBoundary(t *testing.T) {
 
 func TestExportedTypesDoNotEmbedLDAPClient(t *testing.T) {
 	client := reflect.TypeOf((*ldap.Client)(nil)).Elem()
-	for _, value := range []any{Config{}, TLSConfig{}, AuthConfig{}, Snapshot{}, Event{}, Connection{}, Pool{}} {
+	for _, value := range []any{Config{}, TLSConfig{}, AuthConfig{}, CredentialGuardConfig{}, CredentialGuard{}, Snapshot{}, Event{}, Connection{}, Pool{}} {
 		typeOf := reflect.TypeOf(value)
 		for i := 0; i < typeOf.NumField(); i++ {
 			field := typeOf.Field(i)

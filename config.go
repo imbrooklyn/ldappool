@@ -98,7 +98,33 @@ type AuthConfig struct {
 	BindPrincipal string
 	// Password is the fixed simple-Bind secret.
 	Password Secret
+	// CredentialGuard optionally supplies a shared simple-Bind identity,
+	// password, classifier, and guard state. When non-nil, BindPrincipal and
+	// Password must be empty. Pools using the same guard serialize Bind
+	// operations and share block/backoff decisions.
+	CredentialGuard *CredentialGuard
 }
+
+// CredentialGuardConfig configures a credential guard that may be shared by
+// multiple pools using the same simple-Bind identity.
+type CredentialGuardConfig struct {
+	// BindPrincipal is the fixed simple-Bind identity shared by attached pools.
+	BindPrincipal string
+	// Password is the initial simple-Bind secret.
+	Password Secret
+	// CredentialBackoff controls delayed credential probes. Zero fields select
+	// the same defaults as Config.CredentialBackoff.
+	CredentialBackoff BackoffConfig
+	// CredentialFailureClassifier optionally applies deployment credential
+	// policy for every pool using this guard.
+	CredentialFailureClassifier CredentialFailureClassifier
+}
+
+// String returns a constant redacted representation.
+func (CredentialGuardConfig) String() string { return "ldappool.CredentialGuardConfig{[REDACTED]}" }
+
+// GoString returns a constant redacted representation.
+func (CredentialGuardConfig) GoString() string { return "ldappool.CredentialGuardConfig{[REDACTED]}" }
 
 // String returns a constant redacted representation.
 func (AuthConfig) String() string { return "ldappool.AuthConfig{[REDACTED]}" }
@@ -160,14 +186,16 @@ type Config struct {
 	// ConnectBackoff limits new connection attempts after ordinary failures.
 	// Zero fields default to 100ms initial, 2x, 30s maximum, and 20% jitter.
 	ConnectBackoff BackoffConfig
-	// CredentialBackoff controls delayed credential probes. Zero fields default
-	// to 5s initial, 2x, 5m maximum, and 30% jitter.
+	// CredentialBackoff controls delayed credential probes for a private guard.
+	// Zero fields default to 5s initial, 2x, 5m maximum, and 30% jitter. It must
+	// be zero when Auth.CredentialGuard is non-nil.
 	CredentialBackoff BackoffConfig
 
 	// Dialer optionally supplies a context-aware transport. Nil uses net.Dialer.
 	Dialer Dialer
 	// CredentialFailureClassifier optionally applies deployment credential
-	// policy. Nil uses the conservative built-in classifier.
+	// policy to a private guard. Nil uses the conservative built-in classifier;
+	// it must be nil when Auth.CredentialGuard is non-nil.
 	CredentialFailureClassifier CredentialFailureClassifier
 	// Observer optionally receives redacted asynchronous events. Nil disables events.
 	Observer Observer
@@ -203,6 +231,7 @@ type resolvedConfig struct {
 	credentialBackoff backoffPolicy
 	dialer            Dialer
 	classifier        CredentialFailureClassifier
+	credentialGuard   *CredentialGuard
 	observer          Observer
 	observerBuffer    int
 }
@@ -280,19 +309,36 @@ func resolveConfig(c Config) (resolvedConfig, error) {
 
 	switch c.Auth.Mode {
 	case AuthSimple:
-		if strings.TrimSpace(c.Auth.BindPrincipal) == "" {
-			return out, configError("Auth.BindPrincipal", "is required for simple authentication")
-		}
-		if c.Auth.Password.empty() {
-			return out, configError("Auth.Password", "must not be empty for simple authentication")
+		if c.Auth.CredentialGuard != nil {
+			if c.Auth.CredentialGuard.credentialAuthority == nil {
+				return out, configError("Auth.CredentialGuard", "must be constructed with NewCredentialGuard")
+			}
+			if c.Auth.BindPrincipal != "" || !c.Auth.Password.empty() {
+				return out, configError("Auth", "shared credentials cannot include a per-pool principal or password")
+			}
+			if c.CredentialBackoff != (BackoffConfig{}) {
+				return out, configError("CredentialBackoff", "is configured by Auth.CredentialGuard")
+			}
+			if c.CredentialFailureClassifier != nil {
+				return out, configError("CredentialFailureClassifier", "is configured by Auth.CredentialGuard")
+			}
+			out.credentialGuard = c.Auth.CredentialGuard
+			out.bindPrincipal = c.Auth.CredentialGuard.bindPrincipal()
+		} else {
+			if strings.TrimSpace(c.Auth.BindPrincipal) == "" {
+				return out, configError("Auth.BindPrincipal", "is required for simple authentication")
+			}
+			if c.Auth.Password.empty() {
+				return out, configError("Auth.Password", "must not be empty for simple authentication")
+			}
+			out.bindPrincipal = c.Auth.BindPrincipal
 		}
 		if mode == TLSPlaintext && !c.AllowInsecurePlaintextCredentials {
 			return out, configError("AllowInsecurePlaintextCredentials", "must be explicitly enabled for a plaintext simple Bind")
 		}
-		out.bindPrincipal = c.Auth.BindPrincipal
 	case AuthAnonymous:
-		if c.Auth.BindPrincipal != "" || !c.Auth.Password.empty() {
-			return out, configError("Auth", "anonymous authentication cannot include a principal or password")
+		if c.Auth.BindPrincipal != "" || !c.Auth.Password.empty() || c.Auth.CredentialGuard != nil {
+			return out, configError("Auth", "anonymous authentication cannot include credential fields")
 		}
 	default:
 		return out, configError("Auth.Mode", "must explicitly select simple or anonymous authentication")
@@ -349,6 +395,9 @@ func resolveConfig(c Config) (resolvedConfig, error) {
 		out.dialer = c.Dialer
 	}
 	out.classifier = c.CredentialFailureClassifier
+	if out.credentialGuard != nil {
+		out.classifier = out.credentialGuard.classifier()
+	}
 	out.observer = c.Observer
 	if c.ObserverBuffer < 0 {
 		return out, configError("ObserverBuffer", "must not be negative")
@@ -365,7 +414,7 @@ func resolveConfig(c Config) (resolvedConfig, error) {
 			out.observerBuffer = defaultObserverQueue
 		}
 	}
-	if out.authMode == AuthSimple {
+	if out.authMode == AuthSimple && out.credentialGuard == nil {
 		out.password = c.Auth.Password.cloneBytes()
 	}
 	return out, nil

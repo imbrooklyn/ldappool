@@ -42,6 +42,12 @@ func TestNewIsLazyAndAppliesDefaults(t *testing.T) {
 
 func TestConfigValidation(t *testing.T) {
 	clientCertificate, _ := testCertificate(t, []string{"client.example.test"}, nil)
+	sharedGuard, err := NewCredentialGuard(CredentialGuardConfig{
+		BindPrincipal: "cn=shared,dc=example", Password: NewSecret([]byte("secret")),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	valid := Config{
 		Endpoint: "ldap://ldap.example.test",
 		TLS:      TLSConfig{Mode: TLSStartTLS},
@@ -92,8 +98,24 @@ func TestConfigValidation(t *testing.T) {
 		{"unsupported auth mode", func(c *Config) { c.Auth.Mode = AuthMode(255) }, "Auth.Mode"},
 		{"simple principal", func(c *Config) { c.Auth = AuthConfig{Mode: AuthSimple, Password: NewSecret([]byte("x"))} }, "Auth.BindPrincipal"},
 		{"simple password", func(c *Config) { c.Auth = AuthConfig{Mode: AuthSimple, BindPrincipal: "cn=service"} }, "Auth.Password"},
+		{"zero shared guard", func(c *Config) { c.Auth = AuthConfig{Mode: AuthSimple, CredentialGuard: &CredentialGuard{}} }, "Auth.CredentialGuard"},
+		{"shared principal", func(c *Config) {
+			c.Auth = AuthConfig{Mode: AuthSimple, CredentialGuard: sharedGuard, BindPrincipal: "cn=other"}
+		}, "Auth"},
+		{"shared password", func(c *Config) {
+			c.Auth = AuthConfig{Mode: AuthSimple, CredentialGuard: sharedGuard, Password: NewSecret([]byte("other"))}
+		}, "Auth"},
+		{"shared per-pool backoff", func(c *Config) {
+			c.Auth = AuthConfig{Mode: AuthSimple, CredentialGuard: sharedGuard}
+			c.CredentialBackoff.Initial = time.Second
+		}, "CredentialBackoff"},
+		{"shared per-pool classifier", func(c *Config) {
+			c.Auth = AuthConfig{Mode: AuthSimple, CredentialGuard: sharedGuard}
+			c.CredentialFailureClassifier = CredentialFailureClassifierFunc(func(CredentialFailure) CredentialDecision { return CredentialDecision{} })
+		}, "CredentialFailureClassifier"},
 		{"anonymous fields", func(c *Config) { c.Auth.BindPrincipal = "cn=service" }, "Auth"},
 		{"anonymous password", func(c *Config) { c.Auth.Password = NewSecret([]byte("x")) }, "Auth"},
+		{"anonymous shared guard", func(c *Config) { c.Auth.CredentialGuard = sharedGuard }, "Auth"},
 		{"plaintext simple", func(c *Config) {
 			c.TLS.Mode = TLSPlaintext
 			c.Auth = AuthConfig{Mode: AuthSimple, BindPrincipal: "cn=service", Password: NewSecret([]byte("x"))}
@@ -140,6 +162,31 @@ func TestConfigValidation(t *testing.T) {
 			}
 			if configErr.Field != test.field {
 				t.Fatalf("field = %q, want %q", configErr.Field, test.field)
+			}
+		})
+	}
+}
+
+func TestCredentialGuardConfigValidation(t *testing.T) {
+	tests := []struct {
+		name   string
+		config CredentialGuardConfig
+		field  string
+	}{
+		{name: "missing principal", config: CredentialGuardConfig{Password: NewSecret([]byte("secret"))}, field: "CredentialGuard.BindPrincipal"},
+		{name: "blank principal", config: CredentialGuardConfig{BindPrincipal: " ", Password: NewSecret([]byte("secret"))}, field: "CredentialGuard.BindPrincipal"},
+		{name: "missing password", config: CredentialGuardConfig{BindPrincipal: "cn=service"}, field: "CredentialGuard.Password"},
+		{name: "bad backoff", config: CredentialGuardConfig{BindPrincipal: "cn=service", Password: NewSecret([]byte("secret")), CredentialBackoff: BackoffConfig{Jitter: 1}}, field: "CredentialGuard.CredentialBackoff"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			guard, err := NewCredentialGuard(test.config)
+			if guard != nil {
+				t.Fatal("NewCredentialGuard returned a non-nil guard")
+			}
+			var configErr *ConfigError
+			if !errors.As(err, &configErr) || configErr.Field != test.field {
+				t.Fatalf("NewCredentialGuard error = %v, want field %s", err, test.field)
 			}
 		})
 	}
@@ -202,6 +249,11 @@ func TestSensitiveContainerFormattingIsAlwaysRedacted(t *testing.T) {
 		AllowInsecurePlaintextCredentials: true,
 		Dialer:                            &testDialer{factory: pipeFactory(successfulLDAPServer, nil)},
 	}
+	guardConfig := CredentialGuardConfig{BindPrincipal: principal, Password: NewSecret([]byte(password))}
+	guard, err := NewCredentialGuard(guardConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
 	pool, err := New(config)
 	if err != nil {
 		t.Fatal(err)
@@ -212,6 +264,9 @@ func TestSensitiveContainerFormattingIsAlwaysRedacted(t *testing.T) {
 		config,
 		config.TLS,
 		config.Auth,
+		guardConfig,
+		guard,
+		*guard,
 		pool,
 		*pool,
 		CredentialFailure{ResultCode: 49, Diagnostic: "format-diagnostic-secret"},

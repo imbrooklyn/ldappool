@@ -226,6 +226,15 @@ type ldapClient interface {
 	PasswordModify(*ldap.PasswordModifyRequest) (*ldap.PasswordModifyResult, error)
 }
 
+type closingLDAPClient interface {
+	IsClosing() bool
+}
+
+func ldapClientIsClosing(client ldapClient) bool {
+	closing, ok := client.(closingLDAPClient)
+	return ok && closing.IsClosing()
+}
+
 type connectionState uint8
 
 const (

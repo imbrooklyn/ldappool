@@ -62,8 +62,7 @@ func (p *Pool) close(ctx context.Context, force bool) error {
 }
 
 func (p *Pool) startShutdown(force bool) {
-	p.identityMu.Lock()
-	defer p.identityMu.Unlock()
+	p.credentials.identityMu.Lock()
 	var closeList []*physicalConn
 	var cancelConnect context.CancelFunc
 	final := false
@@ -71,9 +70,11 @@ func (p *Pool) startShutdown(force bool) {
 	switch p.lifecycle {
 	case poolClosedLifecycle:
 		p.mu.Unlock()
+		p.credentials.identityMu.Unlock()
 		return
 	case poolRunning:
 		p.lifecycle = poolClosingLifecycle
+		p.credentials.unregisterLocked(p.poolState)
 		cancelConnect = p.connectCancel
 		for p.waiters.Len() > 0 {
 			w := p.waiters.Front().Value.(*waiter)
@@ -103,6 +104,7 @@ func (p *Pool) startShutdown(force bool) {
 		}
 	}
 	p.mu.Unlock()
+	p.credentials.identityMu.Unlock()
 	p.rootCancel()
 	if cancelConnect != nil {
 		cancelConnect()
@@ -114,8 +116,7 @@ func (p *Pool) startShutdown(force bool) {
 		p.emit(Event{Type: EventForceClose, Stage: StageClose, Reason: ReasonPoolClose})
 	}
 	if final {
-		p.credential.destroy()
-		p.observer.stop()
+		p.finalize()
 	}
 	if force {
 		p.forceAll()

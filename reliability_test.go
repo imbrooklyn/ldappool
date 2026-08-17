@@ -41,7 +41,11 @@ func TestDialerPanicDoesNotLeakOpenSlot(t *testing.T) {
 func TestConnectAttemptDestroyCancelsAndWipesExactlyOnce(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	owned := []byte("attempt secret")
-	attempt := &connectAttempt{ctx: ctx, cancel: cancel, password: owned}
+	var bindReleases atomic.Int64
+	attempt := &connectAttempt{
+		ctx: ctx, cancel: cancel, password: owned,
+		releaseBind: func() { bindReleases.Add(1) },
+	}
 	attempt.destroy()
 	select {
 	case <-ctx.Done():
@@ -51,12 +55,18 @@ func TestConnectAttemptDestroyCancelsAndWipesExactlyOnce(t *testing.T) {
 	if attempt.password != nil {
 		t.Fatal("connect attempt retained its password slice")
 	}
+	if bindReleases.Load() != 1 {
+		t.Fatalf("connect attempt released Bind slot %d times", bindReleases.Load())
+	}
 	for _, value := range owned {
 		if value != 0 {
 			t.Fatal("connect attempt password storage was not wiped")
 		}
 	}
 	attempt.destroy()
+	if bindReleases.Load() != 1 {
+		t.Fatalf("second destroy released Bind slot again: %d", bindReleases.Load())
+	}
 }
 
 func TestClosedPoolQuiescesOwnedLifecycleAndEveryTransport(t *testing.T) {
@@ -918,7 +928,7 @@ func TestTransportWriteFailureEmitsUnknownOutcome(t *testing.T) {
 	}
 }
 
-func TestIdlePeerCloseEvictsConnectionAfterNotSentFailure(t *testing.T) {
+func TestIdlePeerCloseIsEvictedBeforeHandoff(t *testing.T) {
 	closeFirstPeer := make(chan struct{})
 	dialer := &testDialer{factory: func(_ context.Context, call int) (net.Conn, error) {
 		client, server := net.Pipe()
@@ -946,6 +956,9 @@ func TestIdlePeerCloseEvictsConnectionAfterNotSentFailure(t *testing.T) {
 	waitForCondition(t, func() bool {
 		pool.mu.Lock()
 		defer pool.mu.Unlock()
+		if pool.open == 0 {
+			return true
+		}
 		for _, physical := range pool.physical {
 			if client, ok := physical.client.(*ldap.Conn); ok && client.IsClosing() {
 				return true
@@ -959,16 +972,8 @@ func TestIdlePeerCloseEvictsConnectionAfterNotSentFailure(t *testing.T) {
 		))
 		return searchErr
 	})
-	if !errors.Is(err, ErrNotSent) || !errors.Is(err, ErrTransport) || errors.Is(err, ErrOutcomeUnknown) {
-		t.Fatalf("idle-close operation = %v", err)
-	}
-	if err := pool.WithConnection(contextWithTimeout(t), func(connection *Connection) error {
-		_, searchErr := connection.Search(context.Background(), ldap.NewSearchRequest(
-			"dc=x", ldap.ScopeBaseObject, ldap.NeverDerefAliases, 1, 1, false, "(objectClass=*)", nil, nil,
-		))
-		return searchErr
-	}); err != nil {
-		t.Fatalf("replacement connection failed: %v", err)
+	if err != nil {
+		t.Fatalf("closed idle connection was handed out: %v", err)
 	}
 	if dialer.count() != 2 {
 		t.Fatalf("idle-close recovery dial count = %d, want 2", dialer.count())

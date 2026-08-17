@@ -2,6 +2,7 @@ package ldappool
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -16,6 +17,44 @@ import (
 
 	"github.com/go-ldap/ldap/v3"
 )
+
+func TestConfirmedWriteSurvivesNoticeOfDisconnection(t *testing.T) {
+	dialer := &testDialer{factory: func(_ context.Context, _ int) (net.Conn, error) {
+		client, server := net.Pipe()
+		go func() {
+			defer server.Close()
+			request, err := readLDAPRequest(bufio.NewReader(server))
+			if err != nil {
+				return
+			}
+			var combined bytes.Buffer
+			_ = writeLDAPResult(&combined, request.messageID, ldap.ApplicationAddResponse, ldap.LDAPResultSuccess, "")
+			_ = writeLDAPResultElements(&combined, 0, ldap.ApplicationExtendedResponse,
+				berInteger(0x0a, ldap.LDAPResultUnavailable), berOctet(nil), berOctet(nil),
+				berTLV(0x8a, []byte(noticeOfDisconnectionOID)),
+			)
+			_, _ = server.Write(combined.Bytes())
+		}()
+		return client, nil
+	}}
+	config := anonymousTestConfig(dialer)
+	config.MaxOpen = 1
+	config.MaxIdle = 1
+	pool, err := New(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = pool.WithConnection(contextWithTimeout(t), func(connection *Connection) error {
+		return connection.Add(context.Background(), ldap.NewAddRequest("cn=x", nil))
+	})
+	if err != nil {
+		t.Fatalf("confirmed Add was reversed by Notice of Disconnection: %v", err)
+	}
+	waitForCondition(t, func() bool { return pool.Snapshot().Counts.Open == 0 })
+	if err = pool.Close(contextWithTimeout(t)); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestSynchronousOperationSurface(t *testing.T) {
 	var mu sync.Mutex

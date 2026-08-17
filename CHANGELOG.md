@@ -6,6 +6,25 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Add `CredentialGuard` for sharing one simple-Bind identity, password,
+  credential generation, global Bind single-flight, classifier, and failure
+  state across pools.
+
+### Fixed
+
+- Accept an optional matching StartTLS `responseName` while continuing to
+  reject a mismatched OID or any StartTLS `responseValue`.
+- Recognize LDAP unsolicited notifications and preserve an already confirmed
+  operation result when a Notice of Disconnection follows it.
+- Retire connections already known closed by the go-ldap reader before idle
+  handoff.
+
+### Changed
+
+- Remove the unused legacy credential classifier path.
+
 ## [0.1.0-alpha.1] - 2026-08-17
 
 ### Fixed

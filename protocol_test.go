@@ -1,7 +1,10 @@
 package ldappool
 
 import (
+	"bufio"
 	"bytes"
+	"errors"
+	"net"
 	"testing"
 
 	ber "github.com/go-asn1-ber/asn1-ber"
@@ -169,6 +172,7 @@ func TestInspectLDAPMessageStrictEnvelope(t *testing.T) {
 			}
 			if observation.result != nil {
 				wipe(observation.result.diagnostic)
+				wipe(observation.result.responseName)
 				wipe(observation.result.responseValue)
 			}
 		})
@@ -357,6 +361,45 @@ func TestPasswordModifyResponseValueShapes(t *testing.T) {
 	}
 }
 
+func TestStartTLSResponseOptionalFields(t *testing.T) {
+	tests := []struct {
+		name     string
+		optional [][]byte
+		wantErr  bool
+	}{
+		{name: "response name absent"},
+		{name: "matching response name", optional: [][]byte{berTLV(0x8a, []byte(startTLSOID))}},
+		{name: "wrong response name", optional: [][]byte{berTLV(0x8a, []byte("1.2.3"))}, wantErr: true},
+		{name: "response value", optional: [][]byte{berTLV(0x8b, []byte("value"))}, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client, server := net.Pipe()
+			serverDone := make(chan struct{})
+			go func() {
+				defer close(serverDone)
+				defer server.Close()
+				request, err := readLDAPRequest(bufio.NewReader(server))
+				if err != nil {
+					return
+				}
+				elements := [][]byte{berInteger(0x0a, ldap.LDAPResultSuccess), berOctet(nil), berOctet(nil)}
+				elements = append(elements, test.optional...)
+				_ = writeLDAPResultElements(server, request.messageID, ldap.ApplicationExtendedResponse, elements...)
+			}()
+			err := requestStartTLS(client)
+			_ = client.Close()
+			<-serverDone
+			if (err != nil) != test.wantErr {
+				t.Fatalf("requestStartTLS error = %v, wantErr %v", err, test.wantErr)
+			}
+			if test.wantErr && !errors.Is(err, ErrProtocol) {
+				t.Fatalf("requestStartTLS error = %v, want ErrProtocol", err)
+			}
+		})
+	}
+}
+
 func TestPasswordModifyExchangeSpecificValidation(t *testing.T) {
 	request := ldapMessageObservation{messageID: 1, applicationTag: ldap.ApplicationExtendedRequest, constructed: true}
 	validValue := berTLV(0x30, berTLV(0x80, []byte("generated")))
@@ -416,6 +459,43 @@ func TestOperationResultStatusSequences(t *testing.T) {
 				t.Fatalf("operationResultStatus = (%v, %d, %v, %v)", success, failureCode, hasFailure, err)
 			}
 		})
+	}
+}
+
+func TestNoticeOfDisconnectionPreservesConfirmedWrite(t *testing.T) {
+	request := ldapMessageObservation{messageID: 1, applicationTag: ldap.ApplicationAddRequest, constructed: true}
+	success := ldapMessageObservation{
+		messageID: 1, applicationTag: ldap.ApplicationAddResponse, constructed: true,
+		result: &strictLDAPResult{code: ldap.LDAPResultSuccess},
+	}
+	notice := ldapMessageObservation{
+		messageID: 0, applicationTag: ldap.ApplicationExtendedResponse, constructed: true,
+		result: &strictLDAPResult{
+			code: ldap.LDAPResultUnavailable, responseNamePresent: true,
+			responseName: []byte(noticeOfDisconnectionOID),
+		},
+	}
+	trace := traceSnapshot{
+		writtenBytes: 1,
+		requests:     ldapStreamSnapshot{messages: []ldapMessageObservation{request}},
+		responses:    ldapStreamSnapshot{messages: []ldapMessageObservation{success, notice}},
+	}
+	assessment := assessOperation(OperationAdd, true, nil, trace, false)
+	if assessment.err != nil || !assessment.fatal || assessment.reason != ReasonTransport {
+		t.Fatalf("confirmed write assessment = %+v", assessment)
+	}
+
+	trace.responses.messages = []ldapMessageObservation{{
+		messageID: 0, applicationTag: ldap.ApplicationExtendedResponse, constructed: true,
+		result: &strictLDAPResult{
+			code: ldap.LDAPResultUnavailable, responseNamePresent: true,
+			responseName: []byte(noticeOfDisconnectionOID),
+		},
+	}}
+	assessment = assessOperation(OperationAdd, true, nil, trace, false)
+	if !errors.Is(assessment.err, ErrTransport) || !errors.Is(assessment.err, ErrOutcomeUnknown) ||
+		!assessment.fatal || assessment.reason != ReasonTransport {
+		t.Fatalf("unconfirmed write assessment = %+v", assessment)
 	}
 }
 

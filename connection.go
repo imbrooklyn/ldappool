@@ -450,7 +450,7 @@ func assessOperation(op Operation, write bool, rawErr error, trace traceSnapshot
 		)
 	}
 	if !inspection.complete {
-		if transportFailed || networkWithoutPacket {
+		if transportFailed || networkWithoutPacket || inspection.noticeOfDisconnection {
 			return fatalOperation(op, write, true, errors.Join(rawErr, trace.writeErr, trace.readErr), ErrTransport, ReasonTransport)
 		}
 		return fatalOperation(
@@ -470,7 +470,7 @@ func assessOperation(op Operation, write bool, rawErr error, trace traceSnapshot
 				op, write, true, errors.New("LDAP operation returned while a transport write was active"), ErrTransport, ReasonTransport,
 			)
 		}
-		if transportFailed {
+		if transportFailed || inspection.unsolicited {
 			return operationAssessment{fatal: true, reason: ReasonTransport}
 		}
 		return operationAssessment{}
@@ -492,6 +492,9 @@ func assessOperation(op Operation, write bool, rawErr error, trace traceSnapshot
 		assessment.reason = ReasonTransport
 		operationErr.kinds = []error{ErrTransport}
 		operationErr.Cause = errors.Join(operationErr.Cause, trace.writeErr, trace.readErr)
+	} else if inspection.unsolicited {
+		assessment.fatal = true
+		assessment.reason = ReasonTransport
 	}
 	return assessment
 }

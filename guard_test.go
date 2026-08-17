@@ -6,6 +6,7 @@ import (
 	"errors"
 	"math"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -162,6 +163,135 @@ func TestDefaultCredentialClassifierDoesNotParseVendorText(t *testing.T) {
 		decision := defaultCredentialDecision(CredentialFailure{ResultCode: test.code, Diagnostic: "data 52e"})
 		if decision.Action != test.action {
 			t.Fatalf("code %d action = %d, want %d", test.code, decision.Action, test.action)
+		}
+	}
+}
+
+func TestSharedCredentialGuardSingleFlightsFailureAfterPriorSuccessAcrossPools(t *testing.T) {
+	guard, err := NewCredentialGuard(CredentialGuardConfig{
+		BindPrincipal: "cn=service,dc=example,dc=test",
+		Password:      NewSecret([]byte("secret")),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	validationConfig := simpleTestConfig(&testDialer{factory: pipeFactory(successfulLDAPServer, nil)})
+	validationConfig.Auth = AuthConfig{Mode: AuthSimple, CredentialGuard: guard}
+	validationPool, err := New(validationConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = validationPool.Warmup(contextWithTimeout(t), 1); err != nil {
+		t.Fatal(err)
+	}
+	if err = validationPool.Close(contextWithTimeout(t)); err != nil {
+		t.Fatal(err)
+	}
+
+	var bindAttempts atomic.Int64
+	handler := func(conn net.Conn, _ int) {
+		defer conn.Close()
+		request, readErr := readLDAPRequest(bufio.NewReader(conn))
+		if readErr == nil {
+			bindAttempts.Add(1)
+			_ = writeLDAPResult(conn, request.messageID, ldap.ApplicationBindResponse, ldap.LDAPResultInvalidCredentials, "data 52e")
+		}
+	}
+	dialers := []*testDialer{
+		{factory: pipeFactory(handler, nil)},
+		{factory: pipeFactory(handler, nil)},
+	}
+	pools := make([]*Pool, 0, len(dialers))
+	for _, dialer := range dialers {
+		config := simpleTestConfig(dialer)
+		config.Auth = AuthConfig{Mode: AuthSimple, CredentialGuard: guard}
+		pool, newErr := New(config)
+		if newErr != nil {
+			t.Fatal(newErr)
+		}
+		pools = append(pools, pool)
+	}
+	results := make(chan error, len(pools))
+	for _, pool := range pools {
+		go func(pool *Pool) {
+			results <- pool.WithConnection(contextWithTimeout(t), func(*Connection) error { return nil })
+		}(pool)
+	}
+	for range pools {
+		if result := receive(t, results); !errors.Is(result, ErrCredentialBlocked) {
+			t.Fatalf("shared credential failure = %v", result)
+		}
+	}
+	if got := bindAttempts.Load(); got != 1 {
+		t.Fatalf("shared guard allowed %d failed Bind attempts, want 1", got)
+	}
+	for _, pool := range pools {
+		if snapshot := pool.Snapshot(); snapshot.CredentialState != CredentialBlocked || snapshot.Generation != 1 {
+			t.Fatalf("shared blocked snapshot = %+v", snapshot)
+		}
+		if closeErr := pool.Close(contextWithTimeout(t)); closeErr != nil {
+			t.Fatal(closeErr)
+		}
+	}
+}
+
+func TestSharedCredentialRotationRetiresEveryPool(t *testing.T) {
+	guard, err := NewCredentialGuard(CredentialGuardConfig{
+		BindPrincipal: "cn=service,dc=example,dc=test",
+		Password:      NewSecret([]byte("secret")),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialers := []*testDialer{
+		{factory: pipeFactory(successfulLDAPServer, nil)},
+		{factory: pipeFactory(successfulLDAPServer, nil)},
+	}
+	pools := make([]*Pool, 0, len(dialers))
+	for _, dialer := range dialers {
+		config := simpleTestConfig(dialer)
+		config.Auth = AuthConfig{Mode: AuthSimple, CredentialGuard: guard}
+		pool, newErr := New(config)
+		if newErr != nil {
+			t.Fatal(newErr)
+		}
+		pools = append(pools, pool)
+		if warmErr := pool.Warmup(contextWithTimeout(t), 1); warmErr != nil {
+			t.Fatal(warmErr)
+		}
+	}
+	if err = pools[0].RotateCredentials(NewSecret([]byte("rotated"))); err != nil {
+		t.Fatal(err)
+	}
+	generation, password := guard.credential.snapshot()
+	if generation != 2 || string(password) != "rotated" {
+		wipe(password)
+		t.Fatalf("shared credential after rotation = generation %d, password length %d", generation, len(password))
+	}
+	wipe(password)
+	for _, pool := range pools {
+		waitForCondition(t, func() bool {
+			snapshot := pool.Snapshot()
+			return snapshot.Generation == 2 && snapshot.Counts.Open == 0
+		})
+		if acquireErr := pool.WithConnection(contextWithTimeout(t), func(*Connection) error { return nil }); acquireErr != nil {
+			t.Fatal(acquireErr)
+		}
+	}
+	for index, dialer := range dialers {
+		if dialer.count() != 2 {
+			t.Fatalf("pool %d dial count = %d, want 2", index, dialer.count())
+		}
+	}
+	if err = guard.Reset(); err != nil {
+		t.Fatal(err)
+	}
+	for _, pool := range pools {
+		if snapshot := pool.Snapshot(); snapshot.CredentialState != CredentialClear || snapshot.CredentialReason != CredentialReasonManualReset {
+			t.Fatalf("shared reset snapshot = %+v", snapshot)
+		}
+		if closeErr := pool.Close(contextWithTimeout(t)); closeErr != nil {
+			t.Fatal(closeErr)
 		}
 	}
 }

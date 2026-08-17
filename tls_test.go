@@ -156,7 +156,10 @@ func TestStartTLSSucceedsBeforeLDAPUse(t *testing.T) {
 				_ = server.Close()
 				return
 			}
-			if writeLDAPResult(server, request.messageID, ldap.ApplicationExtendedResponse, ldap.LDAPResultSuccess, "") != nil {
+			if writeLDAPResultElements(server, request.messageID, ldap.ApplicationExtendedResponse,
+				berInteger(0x0a, ldap.LDAPResultSuccess), berOctet(nil), berOctet(nil),
+				berTLV(0x8a, []byte(startTLSOID)),
+			) != nil {
 				_ = server.Close()
 				return
 			}

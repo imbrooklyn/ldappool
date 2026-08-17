@@ -13,6 +13,7 @@ import (
 )
 
 const startTLSOID = "1.3.6.1.4.1.1466.20037"
+const noticeOfDisconnectionOID = "1.3.6.1.4.1.1466.20036"
 
 func requestStartTLS(conn net.Conn) error {
 	request := ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSequence, nil, "LDAP StartTLS request")
@@ -42,13 +43,17 @@ func requestStartTLS(conn net.Conn) error {
 	if response.result != nil {
 		defer func() {
 			wipe(response.result.diagnostic)
+			wipe(response.result.responseName)
 			wipe(response.result.responseValue)
 		}()
 	}
 	if response.validationError != nil || response.messageID != 1 || response.applicationTag != ldap.ApplicationExtendedResponse || !response.constructed || response.result == nil {
 		return protocolFailure("LDAP StartTLS returned an invalid response")
 	}
-	if response.result.responseNamePresent || response.result.responseValuePresent {
+	if response.result.responseNamePresent && string(response.result.responseName) != startTLSOID {
+		return protocolFailure("LDAP StartTLS returned an invalid response name")
+	}
+	if response.result.responseValuePresent {
 		return protocolFailure("LDAP StartTLS returned forbidden response data")
 	}
 	if response.result.code != ldap.LDAPResultSuccess {
@@ -127,6 +132,7 @@ type strictLDAPResult struct {
 	code                 int64
 	diagnostic           []byte
 	responseNamePresent  bool
+	responseName         []byte
 	responseValuePresent bool
 	responseValue        []byte
 }
@@ -194,8 +200,10 @@ func (s *ldapMessageStream) destroy() {
 	for index := range s.messages {
 		if result := s.messages[index].result; result != nil {
 			wipe(result.diagnostic)
+			wipe(result.responseName)
 			wipe(result.responseValue)
 			result.diagnostic = nil
+			result.responseName = nil
 			result.responseValue = nil
 		}
 	}
@@ -274,7 +282,7 @@ func inspectLDAPMessage(buffer []byte) (observation ldapMessageObservation) {
 		return observation
 	}
 	observation.messageID, observation.validationError = parseBERInt64(messageID.content)
-	if observation.validationError != nil || observation.messageID <= 0 || observation.messageID > math.MaxInt32 {
+	if observation.validationError != nil || observation.messageID < 0 || observation.messageID > math.MaxInt32 {
 		observation.validationError = errors.New("LDAPMessage has an invalid message ID value")
 		return observation
 	}
@@ -460,6 +468,7 @@ func inspectLDAPResult(response *ber.Packet) (*strictLDAPResult, error) {
 				return result, errors.New("ExtendedResponse responseName is invalid")
 			}
 			result.responseNamePresent = true
+			result.responseName = append([]byte(nil), response.Children[index].Data.Bytes()...)
 			index++
 		}
 		if index < len(response.Children) && packetHasIdentifier(response.Children[index], ber.ClassContext, ber.TypePrimitive, 11) {
@@ -553,17 +562,21 @@ func parseBERInt64(buffer []byte) (int64, error) {
 }
 
 type ldapExchangeInspection struct {
-	results  []*strictLDAPResult
-	observed []*strictLDAPResult
-	complete bool
-	err      error
+	results               []*strictLDAPResult
+	observed              []*strictLDAPResult
+	complete              bool
+	unsolicited           bool
+	noticeOfDisconnection bool
+	err                   error
 }
 
 func (i *ldapExchangeInspection) destroy() {
 	for _, result := range i.observed {
 		wipe(result.diagnostic)
+		wipe(result.responseName)
 		wipe(result.responseValue)
 		result.diagnostic = nil
+		result.responseName = nil
 		result.responseValue = nil
 	}
 }
@@ -607,6 +620,9 @@ func inspectLDAPExchange(trace traceSnapshot, requestTag, responseTag uint64, se
 	requests := make(map[int64]*requestState, len(trace.requests.messages))
 	for _, request := range trace.requests.messages {
 		inspection.err = errors.Join(inspection.err, request.validationError)
+		if request.messageID == 0 {
+			inspection.err = errors.Join(inspection.err, errors.New("LDAP request used the unsolicited message ID"))
+		}
 		if request.applicationTag != requestTag || request.constructed != requestTagIsConstructed(requestTag) {
 			inspection.err = errors.Join(inspection.err, errors.New("LDAP request shape did not match the public operation"))
 		}
@@ -623,6 +639,22 @@ func inspectLDAPExchange(trace traceSnapshot, requestTag, responseTag uint64, se
 		inspection.err = errors.Join(inspection.err, errors.New("LDAP operation dispatched an unexpected number of requests"))
 	}
 	for _, response := range trace.responses.messages {
+		if response.messageID == 0 {
+			if response.validationError != nil || response.applicationTag != ldap.ApplicationExtendedResponse ||
+				!response.constructed || response.result == nil || !response.result.responseNamePresent {
+				inspection.err = errors.Join(inspection.err, errors.New("LDAP unsolicited notification was invalid"))
+				continue
+			}
+			inspection.unsolicited = true
+			if string(response.result.responseName) == noticeOfDisconnectionOID {
+				if response.result.responseValuePresent {
+					inspection.err = errors.Join(inspection.err, errors.New("LDAP Notice of Disconnection contained a response value"))
+					continue
+				}
+				inspection.noticeOfDisconnection = true
+			}
+			continue
+		}
 		inspection.err = errors.Join(inspection.err, response.validationError)
 		state := requests[response.messageID]
 		if state == nil {

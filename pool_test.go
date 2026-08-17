@@ -217,14 +217,14 @@ func TestBlockedCredentialGuardDoesNotScheduleExpiredCreationGate(t *testing.T) 
 		cfg:       resolvedConfig{maxOpen: 2, maxIdleTime: time.Minute, maxLifetime: time.Minute},
 		lifecycle: poolRunning,
 		retryAt:   time.Now().Add(-time.Second),
-		guard: newCredentialGuard(backoffPolicy{
+		credentials: newCredentialAuthority("", nil, backoffPolicy{
 			initial: time.Second, multiplier: 2, max: time.Minute, jitter: .1,
-		}),
+		}, nil, false),
 	}}
-	pool.guard.mu.Lock()
-	pool.guard.state = CredentialBlocked
-	pool.guard.reason = CredentialReasonInvalid
-	pool.guard.mu.Unlock()
+	pool.credentials.guard.mu.Lock()
+	pool.credentials.guard.state = CredentialBlocked
+	pool.credentials.guard.reason = CredentialReasonInvalid
+	pool.credentials.guard.mu.Unlock()
 
 	pool.mu.Lock()
 	waiter := &waiter{ctx: context.Background(), internal: true}

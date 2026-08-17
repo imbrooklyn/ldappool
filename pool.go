@@ -69,13 +69,13 @@ type Pool struct {
 }
 
 type poolState struct {
-	cfg        resolvedConfig
-	identityMu sync.Mutex
+	cfg resolvedConfig
 
 	rootCtx    context.Context
 	rootCancel context.CancelFunc
 
-	// Nested lock order is identityMu, mu, then credential.mu or guard.mu.
+	// Nested lock order is credentials.identityMu, mu, then the credential
+	// store or guard mutex.
 	mu sync.Mutex
 
 	lifecycle  poolLifecycle
@@ -107,9 +107,9 @@ type poolState struct {
 	forceOnce     sync.Once
 	graceTimer    *time.Timer
 	closeCause    error
+	finalOnce     sync.Once
 
-	credential credentialStore
-	guard      credentialGuard
+	credentials *credentialAuthority
 
 	observer    *observerDispatcher
 	closeSlots  chan struct{}
@@ -132,6 +132,15 @@ func New(config Config) (*Pool, error) {
 		return nil, err
 	}
 	rootCtx, cancel := context.WithCancel(context.Background())
+	credentials := (*credentialAuthority)(nil)
+	if resolved.credentialGuard != nil {
+		credentials = resolved.credentialGuard.credentialAuthority
+	} else {
+		credentials = newCredentialAuthority(
+			resolved.bindPrincipal, resolved.password, resolved.credentialBackoff, resolved.classifier, false,
+		)
+		resolved.password = nil
+	}
 	p := &Pool{poolState: &poolState{
 		cfg:           resolved,
 		rootCtx:       rootCtx,
@@ -143,17 +152,16 @@ func New(config Config) (*Pool, error) {
 		wake:          make(chan struct{}, 1),
 		schedulerDone: make(chan struct{}),
 		closeDone:     make(chan struct{}),
-		guard:         newCredentialGuard(resolved.credentialBackoff),
+		credentials:   credentials,
 		observer:      newObserverDispatcher(resolved.observer, resolved.observerBuffer),
 		closeSlots:    make(chan struct{}, min(resolved.maxOpen, 8)),
 		warmupToken:   make(chan struct{}, 1),
 		now:           time.Now,
 		random:        rand.Float64,
 	}}
-	p.credential.password = resolved.password
-	p.credential.generation.Store(1)
 	p.warmupToken <- struct{}{}
 	p.cfg.password = nil
+	p.credentials.register(p.poolState)
 	go p.scheduler()
 	return p, nil
 }
@@ -270,80 +278,65 @@ func (p *Pool) releaseWarmupConnections(connections []*Connection) error {
 	return result
 }
 
-// RotateCredentials replaces the simple-Bind password, increments the Pool
-// identity generation, cancels an old connection attempt, and retires all old
-// generation connections. The Bind principal cannot be changed.
+// RotateCredentials replaces the simple-Bind password, increments the
+// credential generation, cancels old connection attempts, and retires all old
+// generation connections. When the Pool uses a shared CredentialGuard, the
+// rotation applies to every attached Pool. The Bind principal cannot change.
 func (p *Pool) RotateCredentials(secret Secret) error {
-	p.identityMu.Lock()
-	defer p.identityMu.Unlock()
 	if p.cfg.authMode != AuthSimple {
 		return configError("Auth.Password", "credential rotation requires simple authentication")
 	}
-	if secret.empty() {
-		return configError("Auth.Password", "must not be empty")
-	}
-	newPassword := secret.cloneBytes()
-	var closeList []*physicalConn
-	var cancelConnect context.CancelFunc
-	var oldPassword []byte
-	var guard guardSnapshot
+	return p.credentials.rotateCredentials(p.poolState, secret)
+}
+
+// ResetCredentialGuard explicitly clears this Pool's credential guard. When
+// shared, the reset applies to every attached Pool. It does not change
+// credentials or revive existing connections.
+func (p *Pool) ResetCredentialGuard() error {
+	return p.credentials.reset(p.poolState)
+}
+
+func (p *Pool) prepareCredentialRotation(generation uint64) credentialRotationEffect {
+	effect := credentialRotationEffect{pool: p}
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.lifecycle != poolRunning {
-		p.mu.Unlock()
-		wipe(newPassword)
-		return ErrPoolClosed
+		return effect
 	}
-	generation, oldPassword := p.credential.rotateOwned(newPassword)
-	cancelConnect = p.connectCancel
+	effect.active = true
+	effect.cancel = p.connectCancel
 	for _, connection := range append([]*physicalConn(nil), p.idle...) {
 		if connection.generation != generation {
 			p.beginCloseLocked(connection, ReasonCredentialRotation)
-			closeList = append(closeList, connection)
+			effect.closeList = append(effect.closeList, connection)
 		}
 	}
 	p.compactIdleLocked()
 	for _, connection := range p.physical {
-		if connection.state == connectionBorrowed && connection.generation != generation {
-			connection.retire.Store(true)
-			lease := connection.lease
-			if lease == nil || lease.invalidateUnlessBusy() != leaseBusy {
-				reason := ReasonCredentialRotation
-				if connection.fatal.Load() {
-					reason = connection.reason()
-				}
-				p.beginCloseLocked(connection, reason)
-				closeList = append(closeList, connection)
-			}
+		if connection.state != connectionBorrowed || connection.generation == generation {
+			continue
 		}
+		connection.retire.Store(true)
+		lease := connection.lease
+		if lease != nil && lease.invalidateUnlessBusy() == leaseBusy {
+			continue
+		}
+		reason := ReasonCredentialRotation
+		if connection.fatal.Load() {
+			reason = connection.reason()
+		}
+		p.beginCloseLocked(connection, reason)
+		effect.closeList = append(effect.closeList, connection)
 	}
-	guard = p.guard.reset(generation, CredentialReasonCredentialRotated)
-	p.mu.Unlock()
-	wipe(oldPassword)
-	if cancelConnect != nil {
-		cancelConnect()
-	}
-	p.startCloseAll(closeList)
-	p.signal()
-	p.emit(Event{Type: EventCredentialState, CredentialState: guard.state, CredentialReason: guard.reason})
-	return nil
+	return effect
 }
 
-// ResetCredentialGuard explicitly clears this Pool's in-process credential guard.
-// It does not change credentials or revive existing connections.
-func (p *Pool) ResetCredentialGuard() error {
-	p.identityMu.Lock()
-	defer p.identityMu.Unlock()
-	p.mu.Lock()
-	if p.lifecycle != poolRunning {
-		p.mu.Unlock()
-		return ErrPoolClosed
-	}
-	generation := p.credential.generation.Load()
-	guard := p.guard.reset(generation, CredentialReasonManualReset)
-	p.mu.Unlock()
-	p.signal()
-	p.emit(Event{Type: EventCredentialState, CredentialState: guard.state, CredentialReason: guard.reason})
-	return nil
+func (p *Pool) finalize() {
+	p.finalOnce.Do(func() {
+		p.credentials.unregister(p.poolState)
+		p.credentials.destroyPrivate()
+		p.observer.stop()
+	})
 }
 
 // Snapshot returns a passive, redacted state snapshot.
@@ -358,7 +351,7 @@ func (p *Pool) Snapshot() Snapshot {
 	lastStage := p.lastStage
 	lastReason := p.lastReason
 	p.mu.Unlock()
-	guard := p.guard.snapshot()
+	guard := p.credentials.guard.snapshot()
 	state := projectPoolState(lifecycle, counts, healthy, retryAt, guard, now)
 	dropped := uint64(0)
 	if p.observer != nil {
@@ -368,7 +361,7 @@ func (p *Pool) Snapshot() Snapshot {
 		CapturedAt:         now,
 		State:              state,
 		Counts:             counts,
-		Generation:         p.credential.generation.Load(),
+		Generation:         p.credentials.credential.generation.Load(),
 		RetryAt:            retryAt,
 		ConnectFailures:    failures,
 		LastFailureStage:   lastStage,
@@ -422,7 +415,7 @@ func (p *Pool) acquire(ctx context.Context, internal bool) (*Connection, error) 
 		}
 	}
 	if p.open == 0 {
-		guard := p.guard.snapshot()
+		guard := p.credentials.guard.snapshot()
 		if err := p.immediateGateErrorLocked(now, guard); err != nil {
 			p.mu.Unlock()
 			p.startCloseAll(expired)
@@ -517,7 +510,7 @@ func (p *Pool) retirementReason(physical *physicalConn) FailureReason {
 	if p.lifecycle != poolRunning {
 		return ReasonPoolClose
 	}
-	if physical.generation != p.credential.generation.Load() {
+	if physical.generation != p.credentials.credential.generation.Load() {
 		return ReasonCredentialRotation
 	}
 	return physical.reason()
@@ -543,7 +536,7 @@ func (p *Pool) release(connection *Connection, panicked bool) (*physicalConn, bo
 		return physical, closing
 	}
 	physical.lease = nil
-	currentGeneration := p.credential.generation.Load()
+	currentGeneration := p.credentials.credential.generation.Load()
 	healthy := oldState == leaseActive && !physical.fatal.Load() && !physical.retire.Load() &&
 		physical.generation == currentGeneration && p.lifecycle == poolRunning
 	switch {
@@ -556,6 +549,9 @@ func (p *Pool) release(connection *Connection, panicked bool) (*physicalConn, bo
 	case physical.fatal.Load():
 		healthy = false
 		closeReason = physical.reason()
+	case ldapClientIsClosing(physical.client):
+		healthy = false
+		closeReason = ReasonTransport
 	case physical.retire.Load():
 		healthy = false
 		closeReason = ReasonCredentialRotation
@@ -655,7 +651,9 @@ func (p *Pool) collectExpiredLocked(now time.Time) []*physicalConn {
 			continue
 		}
 		reason := ReasonNone
-		if now.Sub(physical.createdAt) >= p.cfg.maxLifetime {
+		if ldapClientIsClosing(physical.client) {
+			reason = ReasonTransport
+		} else if now.Sub(physical.createdAt) >= p.cfg.maxLifetime {
 			reason = ReasonMaxLifetime
 		} else if now.Sub(physical.lastUsedAt) >= p.cfg.maxIdleTime {
 			reason = ReasonIdleTimeout
@@ -733,8 +731,7 @@ func (p *Pool) physicalClosed(physical *physicalConn) {
 		p.emit(Event{Type: EventEviction, Stage: StageClose, Reason: ReasonCloseFailure})
 	}
 	if final {
-		p.credential.destroy()
-		p.observer.stop()
+		p.finalize()
 	}
 	p.failWaitersIfNoOpen()
 	p.signal()
@@ -773,7 +770,7 @@ func (p *Pool) countsLocked() Counts {
 }
 
 func (p *Pool) healthyLocked() int {
-	generation := p.credential.generation.Load()
+	generation := p.credentials.credential.generation.Load()
 	healthy := 0
 	for _, physical := range p.physical {
 		if (physical.state == connectionIdle || physical.state == connectionBorrowed) &&

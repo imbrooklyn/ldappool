@@ -1,7 +1,6 @@
 package ldappool
 
 import (
-	"errors"
 	"math"
 	"math/rand/v2"
 	"sync"
@@ -89,10 +88,13 @@ type credentialGuard struct {
 }
 
 func newCredentialGuard(policy backoffPolicy) credentialGuard {
-	return credentialGuard{generation: 1, state: CredentialClear, reason: CredentialReasonNone, policy: policy}
+	return credentialGuard{
+		generation: 1, state: CredentialClear, reason: CredentialReasonNone,
+		policy: policy,
+	}
 }
 
-func (g *credentialGuard) permit(now time.Time, generation uint64, random float64) (guardPermit, *CredentialError) {
+func (g *credentialGuard) permit(now time.Time, generation uint64, random float64) (guardPermit, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if generation != g.generation {
@@ -134,9 +136,9 @@ func (g *credentialGuard) recheck(permit guardPermit) *CredentialError {
 	return nil
 }
 
-func (g *credentialGuard) abort(permit guardPermit) {
+func (g *credentialGuard) abort(permit guardPermit) bool {
 	if permit.probeID == 0 {
-		return
+		return false
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -145,7 +147,9 @@ func (g *credentialGuard) abort(permit guardPermit) {
 		if g.state == CredentialHalfOpen {
 			g.state = CredentialDelayed
 		}
+		return true
 	}
+	return false
 }
 
 func (g *credentialGuard) bindFailed(permit guardPermit, decision CredentialDecision, now time.Time, random float64) guardSnapshot {
@@ -233,18 +237,6 @@ func (g *credentialGuard) snapshot() guardSnapshot {
 
 func (g *credentialGuard) snapshotLocked() guardSnapshot {
 	return guardSnapshot{state: g.state, reason: g.reason, retryAt: g.retryAt, failures: g.failures}
-}
-
-func classifyCredential(classifier CredentialFailureClassifier, err error) (decision CredentialDecision, panicErr error) {
-	var ldapErr *ldap.Error
-	if !errors.As(err, &ldapErr) || !ldapErrorHasResponseTag(ldapErr, ldap.ApplicationBindResponse) || !isServerResultCode(ldapErr.ResultCode) {
-		return CredentialDecision{Action: CredentialNotCredential}, nil
-	}
-	failure := CredentialFailure{ResultCode: ldapErr.ResultCode}
-	if ldapErr.Err != nil {
-		failure.Diagnostic = ldapErr.Err.Error()
-	}
-	return classifyCredentialFailure(classifier, failure)
 }
 
 func classifyCredentialResult(classifier CredentialFailureClassifier, result *strictLDAPResult) (CredentialDecision, error) {

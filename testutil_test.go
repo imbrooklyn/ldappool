@@ -337,11 +337,13 @@ func assertClosedPoolInvariants(t *testing.T, pool *Pool) {
 		}
 	}
 	waitForCondition(t, func() bool { return len(pool.closeSlots) == 0 })
-	waitForCondition(t, func() bool {
-		pool.credential.mu.Lock()
-		defer pool.credential.mu.Unlock()
-		return len(pool.credential.password) == 0
-	})
+	if !pool.credentials.shared {
+		waitForCondition(t, func() bool {
+			pool.credentials.credential.mu.Lock()
+			defer pool.credentials.credential.mu.Unlock()
+			return len(pool.credentials.credential.password) == 0
+		})
+	}
 	select {
 	case <-pool.rootCtx.Done():
 	default:

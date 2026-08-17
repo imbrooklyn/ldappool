@@ -36,8 +36,8 @@ module is experimental. Prereleases are not a production recommendation.
   handoff without broadcast wakeups.
 - Idle and lifetime eviction with exact `MaxOpen` accounting, including
   connections whose physical close is still running.
-- Pool-owned connection establishment, bounded exponential backoff, and a
-  per-pool, in-process credential guard.
+- Pool-owned connection establishment, bounded exponential backoff, and an
+  in-process credential guard that can optionally be shared across pools.
 - Callback-scoped leases that become invalid after return and reject concurrent
   operations.
 - Explicit write outcome semantics: an update that may have reached the server
@@ -116,13 +116,13 @@ a new pool, except that the simple-Bind password may be changed with
 | `TLS.ClientCertificates` | None | Every entry needs a parseable chain and private key |
 | `TLS.MinVersion` | TLS 1.2 | TLS 1.2 or TLS 1.3 only |
 | `Auth.Mode` | Invalid | Explicit `AuthSimple` or `AuthAnonymous` |
-| `Auth` identity | None | Simple mode requires principal and nonempty `Secret`; anonymous forbids both |
+| `Auth` identity | None | Simple mode requires either principal + nonempty `Secret`, or a shared `CredentialGuard`; anonymous forbids all three |
 | `MaxOpen` / `MaxIdle` | 8 / `min(2, MaxOpen)` | `MaxOpen >= 1`; `1 <= MaxIdle <= MaxOpen` |
 | `MaxWaiters` | 1024 | At least 1; bounds external FIFO waiters |
 | `MaxIdleTime` / `MaxLifetime` | 5m / 30m | Positive and independent; the earlier expiry retires an idle connection |
 | `ConnectTimeout` / `RequestTimeout` / `CloseTimeout` | 10s / 30s / 10s | Positive; each is a separate lifecycle budget |
 | `ConnectBackoff` | 100ms, 2x, 30s cap, 20% jitter | Positive initial; multiplier >= 1; cap >= initial; jitter in `[0,1)` |
-| `CredentialBackoff` | 5s, 2x, 5m cap, 30% jitter | Same validation; zero subfields select their documented defaults |
+| `CredentialBackoff` | 5s, 2x, 5m cap, 30% jitter | Same validation; configured on `CredentialGuardConfig` instead when a guard is shared |
 | `Dialer` | `net.Dialer` | Must honor context and return a fresh transport on every call |
 | `CredentialFailureClassifier` | Conservative built-in policy | Trusted, synchronous, and must not retain raw diagnostics |
 | `Observer` / `ObserverBuffer` | Disabled / 256 when enabled | Buffer is 1 through 65536; a nonzero buffer requires an observer |
@@ -205,22 +205,54 @@ Ordinary connection backoff limits only new dials. It never prevents reuse of
 an already healthy connection. If a healthy connection is borrowed, a waiter
 remains queued for its return even while creation is delayed.
 
-The credential guard is owned by one `Pool` and is not coordinated with other
-pools in the same process. The conservative default treats Busy and Unavailable
-as ordinary connection failures; it blocks future Bind attempts for
-invalid credentials, unsupported or inappropriate authentication,
-security-policy failures, and unknown complete Bind results. A custom
-`CredentialFailureClassifier` can implement vendor policy. Its raw diagnostic
-input is sensitive and must never be logged or retained. Vendor-specific
-classifiers belong in separate optional modules.
+By default, each `Pool` owns an independent credential guard. Applications that
+use the same Bind identity against multiple endpoints can create one
+`CredentialGuard` and assign it to `Auth.CredentialGuard` in every pool. The
+guard owns the principal, password, classifier, backoff policy, generation, and
+failure state. Bind operations are globally single-flight across attached
+pools, so the first credential failure updates the shared state before another
+pool can send a Bind. Dial and TLS setup may still proceed independently.
+
+```go
+guard, err := ldappool.NewCredentialGuard(ldappool.CredentialGuardConfig{
+    BindPrincipal: "cn=service,ou=applications,dc=example,dc=com",
+    Password:      ldappool.NewSecret(passwordBytes),
+})
+if err != nil {
+    return err
+}
+
+pool, err := ldappool.New(ldappool.Config{
+    Endpoint: "ldaps://dc1.example.com:636",
+    TLS:      tlsConfig,
+    Auth: ldappool.AuthConfig{
+        Mode:            ldappool.AuthSimple,
+        CredentialGuard: guard,
+    },
+})
+```
+
+Per-pool `CredentialBackoff` and `CredentialFailureClassifier` settings are
+invalid in shared mode; configure them once on `CredentialGuardConfig`.
+
+The conservative default treats Busy and Unavailable as ordinary connection
+failures; it blocks future Bind attempts for invalid credentials, unsupported
+or inappropriate authentication, security-policy failures, and unknown
+complete Bind results. A custom `CredentialFailureClassifier` can implement
+vendor policy. Its raw diagnostic input is sensitive and must never be logged
+or retained. Vendor-specific classifiers belong in separate optional modules.
 
 A classifier is a trusted extension and must return promptly; it must not wait
 on the same pool attempt that invoked it.
 
-Use `RotateCredentials` to replace the password for the same Bind principal.
-Existing connections from the old generation are retired; borrowed connections
-are closed on return. Use `ResetCredentialGuard` only after an operator has
-established that another probe is safe.
+Use `Pool.RotateCredentials` to replace the password for the same Bind
+principal. In shared mode it rotates the shared guard and retires
+old-generation connections in every attached pool; calling
+`CredentialGuard.RotateCredentials` has the same cross-pool effect and also
+works when no pool is attached. Existing borrowed connections are closed on
+return. `Pool.ResetCredentialGuard` resets the shared guard when present;
+`CredentialGuard.Reset` is the pool-independent equivalent. Reset only after an
+operator has established that another probe is safe.
 
 ## Observability
 

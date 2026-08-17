@@ -14,6 +14,7 @@ type connectAttempt struct {
 	id          uint64
 	ctx         context.Context
 	cancel      context.CancelFunc
+	releaseBind func()
 	generation  uint64
 	password    []byte
 	permit      guardPermit
@@ -22,6 +23,10 @@ type connectAttempt struct {
 
 func (a *connectAttempt) destroy() {
 	a.cleanupOnce.Do(func() {
+		if a.releaseBind != nil {
+			a.releaseBind()
+			a.releaseBind = nil
+		}
 		a.cancel()
 		wipe(a.password)
 		a.password = nil
@@ -98,8 +103,8 @@ func (p *Pool) ensureConnection() {
 	}
 	p.mu.Unlock()
 
-	generation, password := p.credential.snapshot()
-	permit, guardErr := p.guard.permit(now, generation, p.random())
+	generation, password := p.credentials.credential.snapshot()
+	permit, guardErr := p.credentials.permit(now, generation, p.random())
 	if guardErr != nil {
 		wipe(password)
 		p.failWaitersIfNoOpen()
@@ -107,9 +112,9 @@ func (p *Pool) ensureConnection() {
 	}
 	p.mu.Lock()
 	if p.lifecycle != poolRunning || p.waiters.Len() == 0 || p.connecting != 0 || p.open >= p.cfg.maxOpen ||
-		p.now().Before(p.retryAt) || p.credential.generation.Load() != generation {
+		p.now().Before(p.retryAt) || p.credentials.credential.generation.Load() != generation {
 		p.mu.Unlock()
-		p.guard.abort(permit)
+		p.credentials.abort(permit)
 		wipe(password)
 		return
 	}
@@ -125,7 +130,7 @@ func (p *Pool) ensureConnection() {
 
 	attempt := &connectAttempt{id: id, ctx: ctx, cancel: cancel, generation: generation, password: password, permit: permit}
 	if permit.probeID != 0 {
-		guard := p.guard.snapshot()
+		guard := p.credentials.guard.snapshot()
 		p.emit(Event{Type: EventCredentialState, Stage: StageBind, CredentialState: guard.state, CredentialReason: guard.reason, RetryAt: guard.retryAt})
 	}
 	p.emit(Event{Type: EventDialStart, Stage: StageDial})
@@ -141,21 +146,21 @@ func (p *Pool) runConnect(attempt *connectAttempt) {
 	defer func() {
 		attempt.destroy()
 		if recovered := recover(); recovered != nil {
-			p.guard.abort(attempt.permit)
+			p.credentials.abort(attempt.permit)
 			failure := &connectFailure{stage: stage, reason: ReasonDependencyPanic, cause: &PanicError{Source: "connection initialization"}}
 			p.finishConnectFailure(attempt, transport, client, failure)
 			p.emit(Event{Type: EventDependencyPanic, Stage: failure.stage, Reason: failure.reason, Duration: p.now().Sub(started)})
 			return
 		}
 		if !finished {
-			p.guard.abort(attempt.permit)
+			p.credentials.abort(attempt.permit)
 		}
 	}()
 
 	raw, err := p.cfg.dialer.DialContext(attempt.ctx, "tcp", p.cfg.address)
 	if err != nil {
 		finished = true
-		p.guard.abort(attempt.permit)
+		p.credentials.abort(attempt.permit)
 		failure := &connectFailure{stage: StageDial, reason: ReasonDial, cause: err}
 		if raw != nil {
 			transport = newTrackedConn(raw)
@@ -166,7 +171,7 @@ func (p *Pool) runConnect(attempt *connectAttempt) {
 	}
 	if raw == nil {
 		finished = true
-		p.guard.abort(attempt.permit)
+		p.credentials.abort(attempt.permit)
 		failure := &connectFailure{stage: StageDial, reason: ReasonDial, cause: errors.New("dialer returned a nil connection")}
 		p.finishConnectFailure(attempt, nil, nil, failure)
 		p.emit(Event{Type: EventDialFailure, Stage: StageDial, Reason: ReasonDial, Duration: p.now().Sub(started)})
@@ -184,7 +189,7 @@ func (p *Pool) runConnect(attempt *connectAttempt) {
 		if err = transport.SetDeadline(deadline); err != nil {
 			finished = true
 			failure := &connectFailure{stage: StageDial, reason: ReasonInitialization, cause: err}
-			p.guard.abort(attempt.permit)
+			p.credentials.abort(attempt.permit)
 			p.finishConnectFailure(attempt, transport, nil, failure)
 			return
 		}
@@ -198,7 +203,7 @@ func (p *Pool) runConnect(attempt *connectAttempt) {
 		if err = tlsConn.HandshakeContext(attempt.ctx); err != nil {
 			finished = true
 			failure := &connectFailure{stage: StageTLS, reason: ReasonTLSValidation, cause: err}
-			p.guard.abort(attempt.permit)
+			p.credentials.abort(attempt.permit)
 			p.finishConnectFailure(attempt, transport, nil, failure)
 			p.emit(Event{Type: EventTLSFailure, Stage: StageTLS, Reason: ReasonTLSValidation, Duration: p.now().Sub(started)})
 			return
@@ -210,7 +215,7 @@ func (p *Pool) runConnect(attempt *connectAttempt) {
 		if err = requestStartTLS(transport); err != nil {
 			finished = true
 			failure := &connectFailure{stage: StageTLS, reason: ReasonTLSValidation, cause: sanitizeLDAPDiagnostic(err)}
-			p.guard.abort(attempt.permit)
+			p.credentials.abort(attempt.permit)
 			p.finishConnectFailure(attempt, transport, client, failure)
 			p.emit(Event{Type: EventTLSFailure, Stage: StageTLS, Reason: ReasonTLSValidation, Duration: p.now().Sub(started)})
 			return
@@ -219,7 +224,7 @@ func (p *Pool) runConnect(attempt *connectAttempt) {
 		if err = tlsConn.HandshakeContext(attempt.ctx); err != nil {
 			finished = true
 			failure := &connectFailure{stage: StageTLS, reason: ReasonTLSValidation, cause: err}
-			p.guard.abort(attempt.permit)
+			p.credentials.abort(attempt.permit)
 			p.finishConnectFailure(attempt, transport, client, failure)
 			p.emit(Event{Type: EventTLSFailure, Stage: StageTLS, Reason: ReasonTLSValidation, Duration: p.now().Sub(started)})
 			return
@@ -227,7 +232,7 @@ func (p *Pool) runConnect(attempt *connectAttempt) {
 		if !tlsConn.ConnectionState().HandshakeComplete {
 			finished = true
 			failure := &connectFailure{stage: StageTLS, reason: ReasonTLSValidation, cause: errors.New("StartTLS did not produce a verified TLS session")}
-			p.guard.abort(attempt.permit)
+			p.credentials.abort(attempt.permit)
 			p.finishConnectFailure(attempt, transport, client, failure)
 			p.emit(Event{Type: EventTLSFailure, Stage: StageTLS, Reason: ReasonTLSValidation, Duration: p.now().Sub(started)})
 			return
@@ -241,13 +246,28 @@ func (p *Pool) runConnect(attempt *connectAttempt) {
 
 	if err = attempt.ctx.Err(); err != nil {
 		finished = true
-		p.guard.abort(attempt.permit)
+		p.credentials.abort(attempt.permit)
 		p.finishConnectFailure(attempt, transport, client, &connectFailure{stage: StageDial, reason: ReasonContextCancellation, cause: err})
 		return
 	}
-	if guardErr := p.guard.recheck(attempt.permit); guardErr != nil {
+	if p.cfg.authMode == AuthSimple {
+		attempt.releaseBind, err = p.credentials.acquireBind(attempt.ctx)
+		if err != nil {
+			finished = true
+			p.credentials.abort(attempt.permit)
+			p.finishConnectFailure(attempt, transport, client, &connectFailure{stage: StageBind, reason: ReasonContextCancellation, cause: err})
+			return
+		}
+	}
+	if err = attempt.ctx.Err(); err != nil {
 		finished = true
-		p.guard.abort(attempt.permit)
+		p.credentials.abort(attempt.permit)
+		p.finishConnectFailure(attempt, transport, client, &connectFailure{stage: StageBind, reason: ReasonContextCancellation, cause: err})
+		return
+	}
+	if guardErr := p.credentials.recheck(attempt.permit); guardErr != nil {
+		finished = true
+		p.credentials.abort(attempt.permit)
 		p.finishConnectFailure(attempt, transport, client, &connectFailure{
 			stage: StageBind, reason: ReasonBind, cause: guardErr, credential: true, retryAt: guardErr.RetryAt,
 		})
@@ -271,8 +291,8 @@ func (p *Pool) runConnect(attempt *connectAttempt) {
 			bindResult = inspection.results[0]
 		}
 		if bindResult != nil && bindResult.code != ldap.LDAPResultSuccess {
-			decision, panicErr := classifyCredentialResult(p.cfg.classifier, bindResult)
-			guard := p.guard.bindFailed(attempt.permit, decision, p.now(), p.random())
+			decision, panicErr := classifyCredentialResult(p.credentials.classifier, bindResult)
+			guard := p.credentials.bindFailed(attempt.permit, decision, p.now(), p.random())
 			eventReason := ReasonBind
 			finished = true
 			if panicErr != nil {
@@ -303,7 +323,7 @@ func (p *Pool) runConnect(attempt *connectAttempt) {
 		}
 		if inspection.err != nil || !inspection.complete || bindResult == nil || bindResult.code != ldap.LDAPResultSuccess {
 			finished = true
-			p.guard.abort(attempt.permit)
+			p.credentials.abort(attempt.permit)
 			reason, cause := assessBindFailure(bindErr, bindTrace)
 			if len(bindTrace.responses.messages) > 0 || reason != ReasonTransport {
 				reason = ReasonProtocol
@@ -316,20 +336,20 @@ func (p *Pool) runConnect(attempt *connectAttempt) {
 		}
 		if failure := validateBindTransport(bindTrace); failure != nil {
 			finished = true
-			p.guard.abort(attempt.permit)
+			p.credentials.abort(attempt.permit)
 			p.finishConnectFailure(attempt, transport, client, failure)
 			p.emit(Event{Type: EventBindFailure, Stage: StageBind, Reason: ReasonTransport, Duration: p.now().Sub(started)})
 			return
 		}
 		if bindErr != nil {
 			finished = true
-			p.guard.abort(attempt.permit)
+			p.credentials.abort(attempt.permit)
 			failure := &connectFailure{stage: StageBind, reason: ReasonProtocol, cause: protocolFailure("LDAP dependency rejected a valid Bind response")}
 			p.finishConnectFailure(attempt, transport, client, failure)
 			p.emit(Event{Type: EventBindFailure, Stage: StageBind, Reason: ReasonProtocol, Duration: p.now().Sub(started)})
 			return
 		}
-		guard := p.guard.bindSucceeded(attempt.permit)
+		guard := p.credentials.bindSucceeded(attempt.permit)
 		p.emit(Event{Type: EventBindSuccess, Stage: StageBind, CredentialState: guard.state, CredentialReason: guard.reason, Duration: p.now().Sub(started)})
 	}
 
@@ -384,8 +404,11 @@ func (p *Pool) finishConnectSuccess(attempt *connectAttempt, physical *physicalC
 	if p.lifecycle != poolRunning {
 		closeReason = ReasonPoolClose
 		shouldClose = true
-	} else if physical.generation != p.credential.generation.Load() {
+	} else if physical.generation != p.credentials.credential.generation.Load() {
 		closeReason = ReasonCredentialRotation
+		shouldClose = true
+	} else if ldapClientIsClosing(physical.client) {
+		closeReason = ReasonTransport
 		shouldClose = true
 	} else {
 		recovered = p.connectFailures > 0 || p.lastFailure != nil
@@ -458,7 +481,7 @@ func (p *Pool) finishConnectFailure(attempt *connectAttempt, transport *trackedC
 	}
 	p.connecting--
 	p.connectCancel = nil
-	currentGeneration := p.credential.generation.Load()
+	currentGeneration := p.credentials.credential.generation.Load()
 	armBackoff := p.lifecycle == poolRunning && currentGeneration == attempt.generation && !failure.credential
 	if armBackoff {
 		p.connectFailures = incrementFailureCount(p.connectFailures)
@@ -500,8 +523,7 @@ func (p *Pool) finishConnectFailure(attempt *connectAttempt, transport *trackedC
 		p.emit(Event{Type: EventBackoffArmed, Stage: failure.stage, Reason: failure.reason, RetryAt: retryAt})
 	}
 	if final {
-		p.credential.destroy()
-		p.observer.stop()
+		p.finalize()
 	}
 	p.failWaitersIfNoOpen()
 	p.signal()
@@ -514,7 +536,7 @@ func (p *Pool) failWaitersIfNoOpen() {
 		p.mu.Unlock()
 		return
 	}
-	guard := p.guard.snapshot()
+	guard := p.credentials.guard.snapshot()
 	err := p.immediateGateErrorLocked(now, guard)
 	if err == nil {
 		p.mu.Unlock()
@@ -534,7 +556,7 @@ func (p *Pool) nextSchedulerWake() (time.Time, bool) {
 	if p.lifecycle != poolRunning {
 		return time.Time{}, false
 	}
-	guard := p.guard.snapshot()
+	guard := p.credentials.guard.snapshot()
 	var next time.Time
 	for _, physical := range p.idle {
 		if physical.state != connectionIdle {

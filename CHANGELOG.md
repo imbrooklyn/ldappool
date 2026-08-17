@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.2] - 2026-08-18
+
 ### Added
 
 - Add `CredentialGuard` for sharing one simple-Bind identity, password,
@@ -73,6 +75,7 @@ All notable changes to this project are documented here. The format follows
 - The release scan has no reachable or imported-package vulnerabilities;
   module-only GO-2026-5932 is documented as an unreachable residual risk.
 
-[Unreleased]: https://github.com/imbrooklyn/ldappool/compare/v0.1.0-alpha.1...HEAD
+[Unreleased]: https://github.com/imbrooklyn/ldappool/compare/v0.1.0-alpha.2...HEAD
+[0.1.0-alpha.2]: https://github.com/imbrooklyn/ldappool/compare/v0.1.0-alpha.1...v0.1.0-alpha.2
 [0.1.0-alpha.1]: https://github.com/imbrooklyn/ldappool/compare/v0.1.0-alpha...v0.1.0-alpha.1
 [0.1.0-alpha]: https://github.com/imbrooklyn/ldappool/releases/tag/v0.1.0-alpha

@@ -21,7 +21,7 @@ closing a shared connection, or retaining the underlying `ldap.Client`.
 ## Install
 
 ```sh
-go get github.com/imbrooklyn/ldappool@v0.1.0-alpha.1
+go get github.com/imbrooklyn/ldappool@v0.1.0-alpha.2
 ```
 
 Pin an exact tag you have reviewed, and do not rely on `@latest` while the

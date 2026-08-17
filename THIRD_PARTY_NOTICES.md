@@ -1,7 +1,7 @@
 # Third-Party Notices
 
 `ldappool` is licensed under the MIT License. Its compiled production-package
-dependency graph at v0.1.0-alpha.1 includes the following third-party modules.
+dependency graph at v0.1.0-alpha.2 includes the following third-party modules.
 Upstream modules may declare additional dependencies for optional subpackages
 and their own tests; those are not linked into this package. Each dependency's
 own license file is authoritative and must be preserved when source is
@@ -18,7 +18,7 @@ redistributed.
 The dependency versions above are recorded in `go.mod` and `go.sum`. This
 notice is informational and does not replace any dependency's license text.
 
-The 2026-08-17 release scan reports
+The 2026-08-18 release scan reports
 [GO-2026-5932](https://pkg.go.dev/vuln/GO-2026-5932) at the
 `golang.org/x/crypto` module level. The affected `openpgp` package is not
 imported or reachable in the production package graph, and the advisory has no

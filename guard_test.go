@@ -260,7 +260,7 @@ func TestSharedCredentialRotationRetiresEveryPool(t *testing.T) {
 			t.Fatal(warmErr)
 		}
 	}
-	if err = pools[0].RotateCredentials(NewSecret([]byte("rotated"))); err != nil {
+	if err = guard.RotateCredentials(NewSecret([]byte("rotated"))); err != nil {
 		t.Fatal(err)
 	}
 	generation, password := guard.credential.snapshot()
@@ -293,6 +293,98 @@ func TestSharedCredentialRotationRetiresEveryPool(t *testing.T) {
 		if closeErr := pool.Close(contextWithTimeout(t)); closeErr != nil {
 			t.Fatal(closeErr)
 		}
+	}
+}
+
+func TestCredentialGuardDirectLifecycleWithoutAttachedPools(t *testing.T) {
+	guard, err := NewCredentialGuard(CredentialGuardConfig{
+		BindPrincipal: "cn=service,dc=example,dc=test",
+		Password:      NewSecret([]byte("original")),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Unix(100, 0)
+	permit, err := guard.permit(now, 1, .5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocked := guard.bindFailed(
+		permit,
+		CredentialDecision{Action: CredentialBlock, Reason: CredentialReasonInvalid},
+		now,
+		.5,
+	)
+	if blocked.state != CredentialBlocked {
+		t.Fatalf("guard state before rotation = %s, want blocked", blocked.state)
+	}
+
+	oldPassword := guard.credential.password
+	if err = guard.RotateCredentials(NewSecret([]byte("rotated"))); err != nil {
+		t.Fatal(err)
+	}
+	for index, value := range oldPassword {
+		if value != 0 {
+			t.Fatalf("old password byte %d was not wiped", index)
+		}
+	}
+	generation, password := guard.credential.snapshot()
+	if generation != 2 || string(password) != "rotated" {
+		wipe(password)
+		t.Fatalf("rotated credential = generation %d, password length %d", generation, len(password))
+	}
+	wipe(password)
+	rotated := guard.guard.snapshot()
+	guard.guard.mu.Lock()
+	rotatedGeneration := guard.guard.generation
+	guard.guard.mu.Unlock()
+	if rotated.state != CredentialClear || rotated.reason != CredentialReasonCredentialRotated || rotatedGeneration != 2 {
+		t.Fatalf("guard state after rotation = %+v", rotated)
+	}
+
+	if err = guard.Reset(); err != nil {
+		t.Fatal(err)
+	}
+	reset := guard.guard.snapshot()
+	guard.guard.mu.Lock()
+	resetGeneration := guard.guard.generation
+	guard.guard.mu.Unlock()
+	if reset.state != CredentialClear || reset.reason != CredentialReasonManualReset || resetGeneration != 2 {
+		t.Fatalf("guard state after reset = %+v", reset)
+	}
+}
+
+func TestCredentialGuardPublicMethodsRejectInvalidReceiverAndSecret(t *testing.T) {
+	var nilGuard *CredentialGuard
+	for name, guard := range map[string]*CredentialGuard{
+		"nil":  nilGuard,
+		"zero": {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			for method, err := range map[string]error{
+				"RotateCredentials": guard.RotateCredentials(NewSecret([]byte("rotated"))),
+				"Reset":             guard.Reset(),
+			} {
+				var configErr *ConfigError
+				if !errors.As(err, &configErr) || configErr.Field != "CredentialGuard" {
+					t.Fatalf("%s error = %v, want CredentialGuard config error", method, err)
+				}
+			}
+		})
+	}
+
+	guard, err := NewCredentialGuard(CredentialGuardConfig{
+		BindPrincipal: "cn=service,dc=example,dc=test",
+		Password:      NewSecret([]byte("secret")),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = guard.RotateCredentials(Secret{})
+	var configErr *ConfigError
+	if !errors.As(err, &configErr) || configErr.Field != "CredentialGuard.Password" {
+		t.Fatalf("empty rotation secret error = %v, want CredentialGuard.Password config error", err)
 	}
 }
 

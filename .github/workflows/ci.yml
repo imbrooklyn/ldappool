@@ -5,63 +5,122 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
+    name: test (${{ matrix.go }})
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         go: ["1.25.13", "1.26.6"]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-go@v7
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ matrix.go }}
+          check-latest: false
           cache: true
           cache-dependency-path: go.sum
-      - run: go mod verify
-      - run: |
+      - name: Verify downloaded modules
+        run: go mod verify
+      - name: Verify module files are tidy
+        run: |
           go mod tidy
           git diff --exit-code -- go.mod go.sum
-      - run: test -z "$(gofmt -l .)"
-      - run: go vet ./...
-      - run: go test -count=20 -coverprofile=coverage.out ./...
-      - run: |
+      - name: Verify formatting
+        run: test -z "$(gofmt -l .)"
+      - name: Vet
+        run: go vet ./...
+      - name: Repeat tests and collect coverage
+        run: go test -count=20 -coverprofile=coverage.out ./...
+      - name: Enforce coverage floor
+        run: |
           coverage="$(go tool cover -func=coverage.out | awk '/^total:/ {gsub(/%/, "", $3); print $3}')"
           awk -v coverage="$coverage" 'BEGIN { if (coverage < 85) exit 1 }'
-      - if: matrix.go == '1.26.6'
+      - name: Race tests
+        if: matrix.go == '1.26.6'
         run: go test -race -count=10 ./...
-      - if: matrix.go == '1.26.6'
+      - name: Fuzz smoke tests
+        if: matrix.go == '1.26.6'
         run: |
           go test -run='^$' -fuzz=FuzzEndpointAndServerNameNeverPanic -fuzztime=5s
           go test -run='^$' -fuzz=FuzzBackoffIsPositiveAndCapped -fuzztime=5s
           go test -run='^$' -fuzz=FuzzCredentialReasonSanitization -fuzztime=5s
           go test -run='^$' -fuzz=FuzzCredentialGuardCommandSequence -fuzztime=5s
           go test -run='^$' -fuzz=FuzzMalformedLDAPResponseNeverEscapesPanic -fuzztime=5s
-      - if: matrix.go == '1.26.6'
-        uses: golang/govulncheck-action@v1
-        with:
-          go-version-input: "1.26.6"
-          go-package: ./...
-          repo-checkout: false
+      - name: Install pinned govulncheck
+        if: matrix.go == '1.26.6'
+        env:
+          GOBIN: ${{ runner.temp }}/govulncheck-bin
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+      - name: Scan reachable vulnerabilities
+        if: matrix.go == '1.26.6'
+        run: '"${RUNNER_TEMP}/govulncheck-bin/govulncheck" ./...'
 
   cross-compile:
+    name: cross-compile
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-go@v7
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.26.6"
+          check-latest: false
           cache: true
           cache-dependency-path: go.sum
-      - run: GOOS=linux GOARCH=amd64 go test -c -o /tmp/ldappool-linux-amd64.test
-      - run: GOOS=linux GOARCH=arm64 go test -c -o /tmp/ldappool-linux-arm64.test
-      - run: GOOS=windows GOARCH=amd64 go test -c -o /tmp/ldappool-windows-amd64.test.exe
+      - name: Cross-compile Linux amd64
+        run: GOOS=linux GOARCH=amd64 go test -c -o "${RUNNER_TEMP}/ldappool-linux-amd64.test"
+      - name: Cross-compile Linux arm64
+        run: GOOS=linux GOARCH=arm64 go test -c -o "${RUNNER_TEMP}/ldappool-linux-arm64.test"
+      - name: Cross-compile Windows amd64
+        run: GOOS=windows GOARCH=amd64 go test -c -o "${RUNNER_TEMP}/ldappool-windows-amd64.test.exe"
+
+  required:
+    name: required
+    if: ${{ always() }}
+    needs: [test, cross-compile]
+    timeout-minutes: 2
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      statuses: write
+    steps:
+      - name: Require every CI job
+        env:
+          TEST_RESULT: ${{ needs.test.result }}
+          CROSS_COMPILE_RESULT: ${{ needs.cross-compile.result }}
+        run: |
+          if [[ "$TEST_RESULT" != "success" || "$CROSS_COMPILE_RESULT" != "success" ]]; then
+            echo "required CI failed: test=${TEST_RESULT}, cross-compile=${CROSS_COMPILE_RESULT}" >&2
+            exit 1
+          fi
+      - name: Publish required commit status
+        if: ${{ github.event_name != 'pull_request' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
+            -f state=success \
+            -f context=required \
+            -f description='Complete CI workflow passed' \
+            -f target_url="$TARGET_URL"

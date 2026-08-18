@@ -6,6 +6,38 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-beta.1] - 2026-08-20
+
+### Added
+
+- Define explicit beta, RC, and final v0.1.0 entry gates and compatibility
+  promises.
+- Add direct tests for the alpha.2 `CredentialGuard` API and critical
+  connection-completion and shutdown transitions.
+
+### Fixed
+
+- Make the vulnerability scan use the already configured Go toolchain and a
+  pinned scanner, avoiding the duplicate Go cache restore that made the
+  release gate fail after the product tests had passed.
+- Add one stable aggregate CI check and a signed-tag release workflow so a
+  release candidate cannot be treated as publishable before all gates pass.
+- Publish the successful aggregate result as both a GitHub Actions check and a
+  GitHub Actions-authenticated commit status, allowing protected direct pushes
+  to enforce the same exact-candidate gate without a pull request.
+
+### Changed
+
+- Define a solo-maintainer direct-release path: pull-request approval is not
+  required, while exact-candidate and `main` CI plus the signed-tag Release
+  Gate remain mandatory.
+
+### Documentation
+
+- Record completed `v0.1.0-alpha.2` validation in a real Microsoft Active
+  Directory test environment and clarify the public evidence boundary.
+- Document request and custom-control ownership during synchronous operations.
+
 ## [0.1.0-alpha.2] - 2026-08-18
 
 ### Added
@@ -75,7 +107,8 @@ All notable changes to this project are documented here. The format follows
 - The release scan has no reachable or imported-package vulnerabilities;
   module-only GO-2026-5932 is documented as an unreachable residual risk.
 
-[Unreleased]: https://github.com/imbrooklyn/ldappool/compare/v0.1.0-alpha.2...HEAD
+[Unreleased]: https://github.com/imbrooklyn/ldappool/compare/v0.1.0-beta.1...HEAD
+[0.1.0-beta.1]: https://github.com/imbrooklyn/ldappool/compare/v0.1.0-alpha.2...v0.1.0-beta.1
 [0.1.0-alpha.2]: https://github.com/imbrooklyn/ldappool/compare/v0.1.0-alpha.1...v0.1.0-alpha.2
 [0.1.0-alpha.1]: https://github.com/imbrooklyn/ldappool/compare/v0.1.0-alpha...v0.1.0-alpha.1
 [0.1.0-alpha]: https://github.com/imbrooklyn/ldappool/releases/tag/v0.1.0-alpha

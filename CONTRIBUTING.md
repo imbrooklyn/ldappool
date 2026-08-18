@@ -6,7 +6,8 @@ Thank you for improving `ldappool`.
 
 - Go 1.25 language compatibility or later; use Go 1.25.13, Go 1.26.6, or a
   newer supported security-patched toolchain
-- no real LDAP or Active Directory dependency in tests
+- no external LDAP or Active Directory dependency in the deterministic unit,
+  race, fuzz, or pull-request gate suite
 - no network, database, web framework, worker, or business-repository
   dependency in the production package
 
@@ -50,6 +51,12 @@ Use `net.Pipe`, in-memory certificates, and scripted BER peers. Include the
 race detector for changes to lifecycle, waiter, guard, observer, or transport
 code. Add fuzz seeds for malformed protocol input and property assertions for
 counter transitions where relevant.
+
+Maintainer-run integration validation may use a real LDAP or Active Directory
+test environment. It must be opt-in, must not put credentials, hostnames, or
+directory data in source, logs, fixtures, or public artifacts, and must not be
+made a pull-request requirement unless CI is provisioned with an isolated and
+disposable environment.
 
 The preferred direct production dependency set is the Go standard library plus
 `github.com/go-ldap/ldap/v3`. Do not add a framework, logger, metrics SDK, test

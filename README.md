@@ -7,8 +7,9 @@ security policy, and fixed authentication identity.
 The API deliberately prevents callers from rebinding, changing TLS state,
 closing a shared connection, or retaining the underlying `ldap.Client`.
 
-> Status: alpha/experimental. The API is under validation until v1.0.0, and
-> prereleases are not recommended for production use.
+> Status: `v0.1.0-beta.1` prerelease. The API is under validation, and this
+> prerelease is not recommended for production use. The beta, RC, and v0.1.0
+> entry and compatibility promises are defined in [BETA.md](BETA.md).
 
 ## Requirements
 
@@ -21,11 +22,23 @@ closing a shared connection, or retaining the underlying `ldap.Client`.
 ## Install
 
 ```sh
-go get github.com/imbrooklyn/ldappool@v0.1.0-alpha.2
+go get github.com/imbrooklyn/ldappool@v0.1.0-beta.1
 ```
 
 Pin an exact tag you have reviewed, and do not rely on `@latest` while the
 module is experimental. Prereleases are not a production recommendation.
+
+## Validation status
+
+On 2026-08-18, `v0.1.0-alpha.2` completed end-to-end validation in a real
+Microsoft Active Directory test environment. The repository contains no
+credentials or real directory data, and the repeatable automated suite remains
+independent of external LDAP infrastructure. The exact AD DS build, topology,
+policy configuration, and case-level matrix have not yet been recorded
+publicly, so this evidence is not a claim of compatibility with every Active
+Directory deployment. `v0.1.0-beta.1` changes tests, documentation, and release
+automation only; it does not change the production package validated as
+alpha.2. See [BETA.md](BETA.md) for the precise prerelease gates.
 
 ## Why this package
 
@@ -166,6 +179,13 @@ lease:
 - `Search`, `SearchWithPaging`, `DirSync`, and `Compare`
 - `Add`, `Modify`, `Del`, `ModifyDN`, and `PasswordModify`
 
+Each operation copies the request outer value and the mutable slices it uses.
+Paging and DirSync controls are deep-copied because go-ldap mutates them;
+arbitrary custom `ldap.Control` values cannot be cloned generically and remain
+referenced. Treat the request and every object reachable from a custom control
+as immutable until the operation returns. A custom control reused by concurrent
+operations must support concurrent `Encode` calls.
+
 Asynchronous searches, streaming responses, Bind, StartTLS, Unbind, arbitrary
 Extended operations, `WhoAmI`, `ModifyWithResult`, and the raw LDAP client are
 not exposed. `ModifyWithResult` and generic Extended operations remain excluded
@@ -282,14 +302,15 @@ pool to exceed `MaxOpen`.
 
 ## Compatibility and support
 
-The module follows semantic versioning. During v0.x, incompatible corrections
-may still be necessary. From v1.0.0, documented exported behavior will remain
-compatible within v1. Dependency upgrades are reviewed against upstream source
-and wire-conformance tests; new upstream methods never become public
-automatically.
+The module follows semantic versioning. During alpha and beta, incompatible
+corrections may still be necessary under the rules in [BETA.md](BETA.md). The
+final v0.1.0 promises compatibility for its documented exported surface within
+v0.1.x. From v1.0.0, documented exported behavior will remain compatible within
+v1. Dependency upgrades are reviewed against upstream source and
+wire-conformance tests; new upstream methods never become public automatically.
 
-See [SECURITY.md](SECURITY.md), [CONTRIBUTING.md](CONTRIBUTING.md), and
-[CHANGELOG.md](CHANGELOG.md).
+See [BETA.md](BETA.md), [SECURITY.md](SECURITY.md),
+[CONTRIBUTING.md](CONTRIBUTING.md), and [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

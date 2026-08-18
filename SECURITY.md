@@ -11,7 +11,7 @@ an immediate upgrade impractical, but this is not guaranteed.
 
 The module language floor is Go 1.25.0 because that is the floor of the
 selected go-ldap release. It is not a security endorsement of every Go 1.25
-patch release. Version 0.1.0-alpha.2 is validated with Go 1.25.13 and Go 1.26.6,
+patch release. Version 0.1.0-beta.1 is validated with Go 1.25.13 and Go 1.26.6,
 the supported security-patched releases current on 2026-08-18. Consumers
 compile this library into their own binaries and therefore must keep their Go
 toolchain on a supported, current patch release. CI pins known-safe patch

@@ -1,0 +1,90 @@
+name: Release Gate
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-gate-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    name: complete CI
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  provenance:
+    name: tag provenance
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out complete history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - name: Verify tag syntax, target, and signature
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "$GITHUB_REF_TYPE" != "tag" ]]; then
+            echo "Release Gate must run against a tag ref" >&2
+            exit 1
+          fi
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)(\.[0-9]+)?)?$ ]]; then
+            echo "invalid release tag: $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+
+          tag_type="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}" --jq '.object.type')"
+          tag_object_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}" --jq '.object.sha')"
+          if [[ "$tag_type" != "tag" ]]; then
+            echo "release tags must be annotated, got object type: $tag_type" >&2
+            exit 1
+          fi
+
+          verified="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" --jq '.verification.verified')"
+          target_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" --jq '.object.sha')"
+          if [[ "$verified" != "true" ]]; then
+            echo "GitHub did not verify the release tag signature" >&2
+            exit 1
+          fi
+          if [[ "$target_sha" != "$GITHUB_SHA" ]]; then
+            echo "tag target $target_sha does not match workflow commit $GITHUB_SHA" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$target_sha" refs/remotes/origin/main; then
+            echo "tag target is not contained in main" >&2
+            exit 1
+          fi
+      - name: Verify release documentation
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          grep -Fq "## [${version}]" CHANGELOG.md
+          grep -Fq "@${GITHUB_REF_NAME}" README.md
+          grep -Fq "${GITHUB_REF_NAME}" THIRD_PARTY_NOTICES.md
+
+  release-ready:
+    name: release-ready
+    if: ${{ always() }}
+    needs: [ci, provenance]
+    timeout-minutes: 2
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require CI and provenance
+        env:
+          CI_RESULT: ${{ needs.ci.result }}
+          PROVENANCE_RESULT: ${{ needs.provenance.result }}
+        run: |
+          if [[ "$CI_RESULT" != "success" || "$PROVENANCE_RESULT" != "success" ]]; then
+            echo "release gate failed: ci=${CI_RESULT}, provenance=${PROVENANCE_RESULT}" >&2
+            exit 1
+          fi
